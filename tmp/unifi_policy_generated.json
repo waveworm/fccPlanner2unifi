@@ -1,0 +1,10 @@
+{
+  "code": "SUCCESS",
+  "data": {
+    "id": "21f22cf3-0604-4f53-ba0d-d0e8d19843d1",
+    "name": "PCO Sync Policy | front_lobby",
+    "resources": [],
+    "schedule_id": "6ed6ac3e-b4c3-4834-a31a-dd7ecabb2c1c"
+  },
+  "msg": "success"
+}

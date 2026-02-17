@@ -1,0 +1,59 @@
+{
+  "code": "SUCCESS",
+  "data": {
+    "holiday_group": {
+      "description": "",
+      "holidays": [],
+      "id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "is_default": true,
+      "is_private": false,
+      "name": "No Holidays",
+      "template_name": ""
+    },
+    "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+    "holiday_schedule": [],
+    "id": "0bd5501e-053b-44ae-aa64-0f3d8596f87b",
+    "is_default": false,
+    "name": "Gym Front Door Unlock Schedule",
+    "type": "access",
+    "weekly": {
+      "friday": [
+        {
+          "end_time": "18:45:59",
+          "start_time": "08:15:00"
+        }
+      ],
+      "monday": [
+        {
+          "end_time": "23:00:59",
+          "start_time": "08:00:00"
+        }
+      ],
+      "saturday": [
+        {
+          "end_time": "18:00:59",
+          "start_time": "07:00:00"
+        }
+      ],
+      "sunday": [],
+      "thursday": [],
+      "tuesday": [
+        {
+          "end_time": "11:30:59",
+          "start_time": "08:45:00"
+        },
+        {
+          "end_time": "23:00:59",
+          "start_time": "16:00:00"
+        }
+      ],
+      "wednesday": [
+        {
+          "end_time": "20:30:59",
+          "start_time": "08:00:00"
+        }
+      ]
+    }
+  },
+  "msg": "success"
+}

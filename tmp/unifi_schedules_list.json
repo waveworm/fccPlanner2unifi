@@ -1,0 +1,102 @@
+{
+  "code": "SUCCESS",
+  "data": [
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "0a16d325-d901-42b8-b9f9-3b8f04db2382",
+      "is_default": true,
+      "name": "Always Access",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "de00823f-795d-4dc6-9800-2ab13644956a",
+      "is_default": false,
+      "name": "Call Schedule excluding Tueday",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "1f582c64-2987-4653-906d-404fa6243e36",
+      "is_default": false,
+      "name": "Calls Mon & Fri Night",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "6c8a8352-37cd-4714-b4c1-92aff7b5345c",
+      "is_default": false,
+      "name": "Full unlock",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "0bd5501e-053b-44ae-aa64-0f3d8596f87b",
+      "is_default": false,
+      "name": "Gym Front Door Unlock Schedule",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "03f2d28e-14c8-40d6-8198-6f69074cc92b",
+      "is_default": false,
+      "name": "Gym Rear Door Unlock Schedule",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "1df9e0ad-a97a-44ec-86bf-c02c92ebd1aa",
+      "is_default": false,
+      "name": "Main Front Door Unlock Schedule",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "4f88594e-dc80-4ab2-9ce5-525748625cc5",
+      "is_default": false,
+      "name": "Main Rear Door Unlock Schedule",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "e08000d7-489b-44e3-8bbb-2f0db826e3f8",
+      "is_default": false,
+      "name": "Manual Lock",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "ec74dd18-baca-45ed-b7e5-41de5f733420",
+      "is_default": false,
+      "name": "Office Door Unlock Schedule",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "29f523fc-4856-4e47-b9cc-8e62811c7054",
+      "is_default": false,
+      "name": "Special Access Tony",
+      "status": 1,
+      "type": "access"
+    },
+    {
+      "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "id": "aa302039-a9c7-4f64-8faf-868005912c7a",
+      "is_default": false,
+      "name": "Special access matt pugh",
+      "status": 1,
+      "type": "access"
+    }
+  ],
+  "msg": "success"
+}

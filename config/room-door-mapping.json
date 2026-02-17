@@ -1,0 +1,59 @@
+{
+  "doors": {
+    "front_lobby": {
+      "label": "Front Lobby",
+      "unifiDoorIds": ["b5f778e6-0c3a-49cd-8f4f-06a7011ee8cd"]
+    },
+    "rear_lobby": {
+      "label": "Rear Lobby",
+      "unifiDoorIds": ["cdf39816-e069-4b4f-8972-918ca1ac9604"]
+    },
+    "gym_front": {
+      "label": "Gym Front",
+      "unifiDoorIds": ["38357452-65f5-4d3e-babc-6e34ce0aa4f7"]
+    }
+  },
+  "rooms": {
+    "Front Lobby": ["front_lobby"],
+    "Rear Lobby": ["rear_lobby"],
+
+    "Lobby": ["front_lobby", "rear_lobby"],
+    "Sanctuary": ["front_lobby", "rear_lobby"],
+    "Overflow Room - Left": ["front_lobby", "rear_lobby"],
+    "Overflow Room - Right": ["front_lobby", "rear_lobby"],
+
+    "115 - Classroom": ["front_lobby", "rear_lobby"],
+    "116 - Classroom": ["front_lobby", "rear_lobby"],
+    "103 Classroom": ["gym_front"],
+    "104 Classroom": ["gym_front"],
+    "110 Classroom": ["gym_front"],
+    "111-112 Classroom": ["gym_front"],
+    "113-114 Classroom": ["gym_front"],
+    "201 - Mt. Laurel Room": ["gym_front"],
+    "204 Classroom": ["gym_front"],
+    "205 Classroom": ["gym_front"],
+
+    "Cafe": ["front_lobby", "rear_lobby"],
+    "Conference Room": ["front_lobby", "rear_lobby"],
+    "Kitchen": ["gym_front"],
+    "Nursery": ["front_lobby", "rear_lobby"],
+
+    "119 Office": ["front_lobby", "rear_lobby"],
+    "Office Lobby": ["front_lobby", "rear_lobby"],
+
+    "Gym": ["gym_front"],
+    "Gymnasium": ["gym_front"]
+  },
+  "defaults": {
+    "unlockLeadMinutes": 15,
+    "unlockLagMinutes": 15
+  },
+  "rules": {
+    "excludeDoorKeysByEventName": [
+      {
+        "eventNameContains": "worship service",
+        "doorKeys": ["gym_front"]
+      }
+    ]
+  }
+}

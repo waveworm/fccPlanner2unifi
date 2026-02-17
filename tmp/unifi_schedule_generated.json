@@ -1,0 +1,72 @@
+{
+  "code": "SUCCESS",
+  "data": {
+    "holiday_group": {
+      "description": "",
+      "holidays": [],
+      "id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+      "is_default": true,
+      "is_private": false,
+      "name": "No Holidays",
+      "template_name": ""
+    },
+    "holiday_group_id": "e12535a8-bdee-4b4b-a79d-13a200d5e19b",
+    "holiday_schedule": [],
+    "id": "6ed6ac3e-b4c3-4834-a31a-dd7ecabb2c1c",
+    "is_default": false,
+    "name": "PCO Sync | front_lobby",
+    "type": "access",
+    "weekly": {
+      "friday": [
+        {
+          "end_time": "07:45:00",
+          "start_time": "05:15:00"
+        },
+        {
+          "end_time": "23:15:00",
+          "start_time": "18:45:00"
+        }
+      ],
+      "monday": [
+        {
+          "end_time": "21:15:00",
+          "start_time": "17:45:00"
+        }
+      ],
+      "saturday": [],
+      "sunday": [
+        {
+          "end_time": "16:45:00",
+          "start_time": "08:30:00"
+        },
+        {
+          "end_time": "19:45:00",
+          "start_time": "17:15:00"
+        }
+      ],
+      "thursday": [
+        {
+          "end_time": "22:30:00",
+          "start_time": "18:30:00"
+        }
+      ],
+      "tuesday": [
+        {
+          "end_time": "21:45:00",
+          "start_time": "18:15:00"
+        }
+      ],
+      "wednesday": [
+        {
+          "end_time": "10:45:00",
+          "start_time": "08:45:00"
+        },
+        {
+          "end_time": "20:15:00",
+          "start_time": "18:15:00"
+        }
+      ]
+    }
+  },
+  "msg": "success"
+}
