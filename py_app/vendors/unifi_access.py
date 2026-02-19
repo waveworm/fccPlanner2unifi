@@ -189,7 +189,7 @@ class UnifiAccessClient:
             "friday": [],
             "saturday": [],
         }
-        eastern = ZoneInfo("America/New_York")
+        local_tz = ZoneInfo(self.settings.display_timezone)
         weekday_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
         ranges_by_day: dict[str, list[tuple[str, str]]] = {k: [] for k in week_schedule.keys()}
@@ -199,8 +199,8 @@ class UnifiAccessClient:
             if not start_raw or not end_raw:
                 continue
             try:
-                start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00")).astimezone(eastern)
-                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).astimezone(eastern)
+                start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00")).astimezone(local_tz)
+                end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).astimezone(local_tz)
             except Exception:
                 continue
 

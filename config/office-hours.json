@@ -1,0 +1,35 @@
+{
+  "enabled": false,
+  "schedule": {
+    "monday": {
+      "ranges": "5:00-6:00",
+      "doors": [
+        "gym_front"
+      ]
+    },
+    "tuesday": {
+      "ranges": "",
+      "doors": []
+    },
+    "wednesday": {
+      "ranges": "",
+      "doors": []
+    },
+    "thursday": {
+      "ranges": "",
+      "doors": []
+    },
+    "friday": {
+      "ranges": "",
+      "doors": []
+    },
+    "saturday": {
+      "ranges": "",
+      "doors": []
+    },
+    "sunday": {
+      "ranges": "",
+      "doors": []
+    }
+  }
+}

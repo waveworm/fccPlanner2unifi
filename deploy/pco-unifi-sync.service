@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/CascadeProjects/windsurf-project
-EnvironmentFile=/root/CascadeProjects/windsurf-project/.env
-ExecStart=/root/CascadeProjects/windsurf-project/.venv/bin/python -m uvicorn py_app.main:app --host 0.0.0.0 --port 3000
+WorkingDirectory=/root/fccplanner2unifi
+EnvironmentFile=/root/fccplanner2unifi/.env
+ExecStart=/root/fccplanner2unifi/.venv/bin/python -m uvicorn py_app.main:app --host 0.0.0.0 --port 3000
 Restart=always
 RestartSec=5
 

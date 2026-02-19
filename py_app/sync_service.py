@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
+from zoneinfo import ZoneInfo
+
 from py_app.mapping import build_desired_schedule, load_room_door_mapping
+from py_app.office_hours import build_office_hours_windows, load_office_hours, merge_office_hours_into_desired
 from py_app.settings import Settings
+from py_app.utils import parse_iso
 from py_app.vendors.pco import PcoClient
 from py_app.vendors.unifi_access import UnifiAccessClient
 
@@ -27,8 +34,9 @@ class SyncService:
         self.unifi = UnifiAccessClient(settings)
         self.status = SyncStatus()
 
-        # In-memory toggle. Default comes from env.
+        # Apply mode: seed from env var, then override with persisted state if present.
         self._apply_to_unifi: bool = bool(getattr(settings, "apply_to_unifi", False))
+        self._load_apply_state()
 
     def snapshot(self) -> dict:
         return {
@@ -46,6 +54,26 @@ class SyncService:
 
     def set_apply_to_unifi(self, value: bool) -> None:
         self._apply_to_unifi = bool(value)
+        self._save_apply_state()
+
+    def _state_path(self) -> Path:
+        return Path(self.settings.room_door_mapping_file).resolve().parent / "sync-state.json"
+
+    def _load_apply_state(self) -> None:
+        try:
+            path = self._state_path()
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self._apply_to_unifi = bool(data.get("applyToUnifi", self._apply_to_unifi))
+        except Exception:
+            pass
+
+    def _save_apply_state(self) -> None:
+        try:
+            path = self._state_path()
+            path.write_text(json.dumps({"applyToUnifi": self._apply_to_unifi}, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
 
     def _push_error(self, msg: str) -> None:
         self.status.recent_errors = [msg, *self.status.recent_errors][:20]
@@ -61,12 +89,26 @@ class SyncService:
             from_dt = now - timedelta(hours=int(self.settings.sync_lookbehind_hours))
             to_dt = now + timedelta(hours=int(self.settings.sync_lookahead_hours))
 
-            pco_ok, unifi_ok = await self.pco.check_connectivity(), await self.unifi.check_connectivity()
+            # Fix 4: run connectivity checks concurrently instead of sequentially.
+            pco_ok, unifi_ok = await asyncio.gather(
+                self.pco.check_connectivity(),
+                self.unifi.check_connectivity(),
+            )
             self.status.pco_status = "ok" if pco_ok else "error"
             self.status.unifi_status = "ok" if unifi_ok else "error"
 
             events = await self.pco.get_events(from_iso=from_dt.isoformat(), to_iso=to_dt.isoformat())
+            # Fix 5: apply the same location filter used by get_preview so behavior is consistent.
+            events = self._filter_events_in_window(events, from_dt, to_dt)
             desired = build_desired_schedule(events=events, mapping=mapping, now_iso=now.isoformat())
+
+            oh_config = load_office_hours(self.settings.office_hours_file)
+            oh_windows = build_office_hours_windows(
+                oh_config, from_dt, to_dt,
+                ZoneInfo(self.settings.display_timezone),
+                mapping.get("doors") or {},
+            )
+            desired = merge_office_hours_into_desired(desired, oh_windows)
 
             if self._apply_to_unifi:
                 await self.unifi.apply_desired_schedule(desired)
@@ -86,24 +128,11 @@ class SyncService:
             self.logger.exception("Sync failed")
             raise
 
-    def _parse_iso(self, value: Any) -> datetime | None:
-        if not value or not isinstance(value, str):
-            return None
-        try:
-            # PCO uses Z; datetime.fromisoformat needs +00:00.
-            v = value.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(v)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            return None
-
     def _filter_events_in_window(self, events: list[dict[str, Any]], start_dt: datetime, end_dt: datetime) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         must_contain = (getattr(self.settings, "pco_location_must_contain", "") or "").strip().lower()
         for e in events:
-            s = self._parse_iso(e.get("startAt"))
+            s = parse_iso(e.get("startAt"))
             if s is None:
                 continue
             if s < start_dt or s > end_dt:
@@ -114,7 +143,7 @@ class SyncService:
                 if must_contain not in hay:
                     continue
             out.append(e)
-        out.sort(key=lambda ev: self._parse_iso(ev.get("startAt")) or datetime.max.replace(tzinfo=timezone.utc))
+        out.sort(key=lambda ev: parse_iso(ev.get("startAt")) or datetime.max.replace(tzinfo=timezone.utc))
         return out
 
     async def get_preview(self, *, start_dt: datetime, end_dt: datetime, limit: int = 200) -> dict:
@@ -125,6 +154,14 @@ class SyncService:
         events = self._filter_events_in_window(events, start_dt, end_dt)
 
         desired = build_desired_schedule(events=events, mapping=mapping, now_iso=now.isoformat())
+
+        oh_config = load_office_hours(self.settings.office_hours_file)
+        oh_windows = build_office_hours_windows(
+            oh_config, start_dt, end_dt,
+            ZoneInfo(self.settings.display_timezone),
+            mapping.get("doors") or {},
+        )
+        desired = merge_office_hours_into_desired(desired, oh_windows)
 
         rooms: dict[str, int] = {}
         for e in events:

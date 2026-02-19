@@ -37,3 +37,5 @@ class Settings(BaseSettings):
     sync_lookbehind_hours: int = Field(default=24, alias="SYNC_LOOKBEHIND_HOURS")
 
     room_door_mapping_file: str = Field(default="./config/room-door-mapping.json", alias="ROOM_DOOR_MAPPING_FILE")
+    office_hours_file: str = Field(default="./config/office-hours.json", alias="OFFICE_HOURS_FILE")
+    display_timezone: str = Field(default="America/New_York", alias="DISPLAY_TIMEZONE")

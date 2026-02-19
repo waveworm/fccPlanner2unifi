@@ -1,45 +1,21 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from py_app.utils import parse_iso
 
-@dataclass(frozen=True)
-class DesiredScheduleItem:
-    source_event_id: str
-    room: str
-    door_key: str
-    door_label: str
-    unifi_door_ids: list[str]
-    start_at: str
-    end_at: str
-    unlock_lead_minutes: int
-    unlock_lag_minutes: int
+
+def _to_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def load_room_door_mapping(mapping_file: str) -> dict[str, Any]:
     path = Path(mapping_file).resolve()
     raw = path.read_text(encoding="utf-8")
     return json.loads(raw)
-
-
-def _parse_iso(value: Any) -> datetime | None:
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _to_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _is_door_excluded_for_event(*, evt: dict[str, Any], door_key: str, mapping: dict[str, Any]) -> bool:
@@ -73,12 +49,12 @@ def _merge_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not windows:
         return []
 
-    sorted_windows = sorted(windows, key=lambda w: _parse_iso(w.get("openStart")) or datetime.max.replace(tzinfo=timezone.utc))
+    sorted_windows = sorted(windows, key=lambda w: parse_iso(w.get("openStart")) or datetime.max.replace(tzinfo=timezone.utc))
     merged: list[dict[str, Any]] = []
 
     for w in sorted_windows:
-        start = _parse_iso(w.get("openStart"))
-        end = _parse_iso(w.get("openEnd"))
+        start = parse_iso(w.get("openStart"))
+        end = parse_iso(w.get("openEnd"))
         if not start or not end:
             continue
 
@@ -95,9 +71,8 @@ def _merge_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
 
         last = merged[-1]
-        last_start = _parse_iso(last.get("openStart"))
-        last_end = _parse_iso(last.get("openEnd"))
-        if not last_start or not last_end:
+        last_end = parse_iso(last.get("openEnd"))
+        if not last_end:
             continue
 
         # If windows overlap or touch, merge into one continuous open period.
@@ -173,8 +148,8 @@ def build_desired_schedule(*, events: list[dict[str, Any]], mapping: dict[str, A
                     }
                 )
 
-                start_dt = _parse_iso(evt.get("startAt"))
-                end_dt = _parse_iso(evt.get("endAt"))
+                start_dt = parse_iso(evt.get("startAt"))
+                end_dt = parse_iso(evt.get("endAt"))
                 if start_dt and end_dt:
                     lead = int(defaults.get("unlockLeadMinutes", 15))
                     lag = int(defaults.get("unlockLagMinutes", 15))
