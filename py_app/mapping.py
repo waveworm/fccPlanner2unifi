@@ -4,8 +4,10 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from py_app.utils import parse_iso
+from py_app.event_overrides import find_door_override
 
 
 def _to_iso(dt: datetime) -> str:
@@ -95,7 +97,14 @@ def _merge_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
-def build_desired_schedule(*, events: list[dict[str, Any]], mapping: dict[str, Any], now_iso: str) -> dict[str, Any]:
+def build_desired_schedule(
+    *,
+    events: list[dict[str, Any]],
+    mapping: dict[str, Any],
+    now_iso: str,
+    overrides: dict[str, Any] | None = None,
+    local_tz: ZoneInfo | None = None,
+) -> dict[str, Any]:
     defaults = mapping.get("defaults") or {"unlockLeadMinutes": 15, "unlockLagMinutes": 15}
     items: list[dict[str, Any]] = []
     windows_by_door: dict[str, list[dict[str, Any]]] = {}
@@ -151,23 +160,42 @@ def build_desired_schedule(*, events: list[dict[str, Any]], mapping: dict[str, A
                 start_dt = parse_iso(evt.get("startAt"))
                 end_dt = parse_iso(evt.get("endAt"))
                 if start_dt and end_dt:
-                    lead = int(defaults.get("unlockLeadMinutes", 15))
-                    lag = int(defaults.get("unlockLagMinutes", 15))
-                    open_start = start_dt - timedelta(minutes=lead)
-                    open_end = end_dt + timedelta(minutes=lag)
+                    door_override = find_door_override(
+                        str(evt.get("name") or ""), door_key, overrides or {}
+                    )
+                    # Build list of (open_start, open_end) UTC pairs for this door+event.
+                    pairs: list[tuple[datetime, datetime]] = []
+                    if door_override is not None and local_tz:
+                        # Override found. windows=[] means suppress this door for this event.
+                        event_date = start_dt.astimezone(local_tz).date()
+                        for win_cfg in (door_override.get("windows") or []):
+                            oh, om = map(int, win_cfg["openTime"].split(":"))
+                            ch, cm = map(int, win_cfg["closeTime"].split(":"))
+                            pairs.append((
+                                datetime(event_date.year, event_date.month, event_date.day,
+                                         oh, om, tzinfo=local_tz).astimezone(timezone.utc),
+                                datetime(event_date.year, event_date.month, event_date.day,
+                                         ch, cm, tzinfo=local_tz).astimezone(timezone.utc),
+                            ))
+                    else:
+                        # No override (or no local_tz) — use default lead/lag.
+                        lead = int(defaults.get("unlockLeadMinutes", 15))
+                        lag = int(defaults.get("unlockLagMinutes", 15))
+                        pairs.append((start_dt - timedelta(minutes=lead), end_dt + timedelta(minutes=lag)))
 
                     door_windows = windows_by_door.setdefault(door_key, [])
-                    door_windows.append(
-                        {
-                            "doorKey": door_key,
-                            "doorLabel": door.get("label", door_key),
-                            "unifiDoorIds": door.get("unifiDoorIds") or [],
-                            "openStart": _to_iso(open_start),
-                            "openEnd": _to_iso(open_end),
-                            "sourceEventIds": [str(evt.get("id", ""))],
-                            "sourceRooms": [room_name],
-                        }
-                    )
+                    for open_start, open_end in pairs:
+                        door_windows.append(
+                            {
+                                "doorKey": door_key,
+                                "doorLabel": door.get("label", door_key),
+                                "unifiDoorIds": door.get("unifiDoorIds") or [],
+                                "openStart": _to_iso(open_start),
+                                "openEnd": _to_iso(open_end),
+                                "sourceEventIds": [str(evt.get("id", ""))],
+                                "sourceRooms": [room_name],
+                            }
+                        )
 
     merged_door_windows: list[dict[str, Any]] = []
     for _door_key, windows in windows_by_door.items():

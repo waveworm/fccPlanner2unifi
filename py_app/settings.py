@@ -38,4 +38,13 @@ class Settings(BaseSettings):
 
     room_door_mapping_file: str = Field(default="./config/room-door-mapping.json", alias="ROOM_DOOR_MAPPING_FILE")
     office_hours_file: str = Field(default="./config/office-hours.json", alias="OFFICE_HOURS_FILE")
+    event_overrides_file: str = Field(default="./config/event-overrides.json", alias="EVENT_OVERRIDES_FILE")
+    event_memory_file: str = Field(default="./config/event-memory.json", alias="EVENT_MEMORY_FILE")
+    cancelled_events_file: str = Field(default="./config/cancelled-events.json", alias="CANCELLED_EVENTS_FILE")
+    pending_approvals_file: str = Field(default="./config/pending-approvals.json", alias="PENDING_APPROVALS_FILE")
+    approved_event_names_file: str = Field(default="./config/approved-event-names.json", alias="APPROVED_EVENT_NAMES_FILE")
+    safe_hours_file: str = Field(default="./config/safe-hours.json", alias="SAFE_HOURS_FILE")
     display_timezone: str = Field(default="America/New_York", alias="DISPLAY_TIMEZONE")
+
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_ids: str = Field(default="", alias="TELEGRAM_CHAT_IDS")  # comma-separated

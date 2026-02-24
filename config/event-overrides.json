@@ -1,0 +1,38 @@
+{
+  "overrides": {
+    "Junior High Youth Group": {
+      "doorOverrides": {
+        "gym_front": {
+          "windows": [
+            {
+              "openTime": "18:40",
+              "closeTime": "19:20"
+            },
+            {
+              "openTime": "21:15",
+              "closeTime": "21:45"
+            }
+          ]
+        }
+      }
+    },
+    "High School Youth Group": {
+      "doorOverrides": {
+        "front_lobby": {
+          "windows": [
+            {
+              "openTime": "18:40",
+              "closeTime": "19:20"
+            }
+          ]
+        },
+        "rear_lobby": {
+          "windows": []
+        },
+        "gym_front": {
+          "windows": []
+        }
+      }
+    }
+  }
+}

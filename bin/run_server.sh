@@ -8,4 +8,6 @@ if [[ ! -d "${PROJECT_DIR}/.venv" ]]; then
   exit 1
 fi
 
-exec "${PROJECT_DIR}/.venv/bin/python" -m uvicorn py_app.main:app --host 0.0.0.0 --port 3000
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-3000}"
+exec "${PROJECT_DIR}/.venv/bin/python" -m uvicorn py_app.main:app --host "$HOST" --port "$PORT"

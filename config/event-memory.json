@@ -1,0 +1,374 @@
+{
+  "events": [
+    {
+      "name": "Women\u2019s CR Step Study",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "116 - Classroom"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-24T23:30:00Z",
+      "nextEndAt": "2026-02-25T02:30:00Z"
+    },
+    {
+      "name": "Futsal League",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Gym",
+        "Kitchen",
+        "201 - Mt. Laurel Room",
+        "205 Classroom"
+      ],
+      "lastSeenAt": "2026-02-24T00:00:00Z",
+      "nextAt": "2026-02-25T00:00:00Z",
+      "nextEndAt": "2026-02-25T03:30:00Z",
+      "lastEndAt": "2026-02-24T03:30:00Z"
+    },
+    {
+      "name": "Young Adults meeting",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Lobby",
+        "Sanctuary",
+        "Overflow Room - Left",
+        "Overflow Room - Right"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-25T00:00:00Z",
+      "nextEndAt": "2026-02-25T02:00:00Z"
+    },
+    {
+      "name": "WOMEN- Bible Study Fellowship Study",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Sanctuary",
+        "Overflow Room - Left",
+        "Overflow Room - Right",
+        "115 - Classroom",
+        "116 - Classroom"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-25T14:00:00Z",
+      "nextEndAt": "2026-02-25T15:30:00Z"
+    },
+    {
+      "name": "Family Night",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "115 - Classroom",
+        "Cafe",
+        "Sanctuary",
+        "116 - Classroom",
+        "Lobby",
+        "Nursery",
+        "Kitchen",
+        "111-112 Classroom",
+        "113-114 Classroom",
+        "201 - Mt. Laurel Room",
+        "205 Classroom",
+        "110 Classroom",
+        "Overflow Room - Left",
+        "Overflow Room - Right"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-25T23:30:00Z",
+      "nextEndAt": "2026-02-26T01:00:00Z"
+    },
+    {
+      "name": "First Few Years - YM - Hopely",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Whole Hope House"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-25T23:30:00Z",
+      "nextEndAt": "2026-02-26T01:00:00Z"
+    },
+    {
+      "name": "Stephen ministry- S Walton",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Whole Hope House"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-26T18:00:00Z",
+      "nextEndAt": "2026-02-26T20:00:00Z"
+    },
+    {
+      "name": "Celebrate Recovery",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Cafe",
+        "Lobby",
+        "Overflow Room - Left",
+        "Overflow Room - Right",
+        "Conference Room",
+        "103 Classroom",
+        "104 Classroom",
+        "110 Classroom",
+        "111-112 Classroom",
+        "113-114 Classroom",
+        "116 - Classroom",
+        "201 - Mt. Laurel Room",
+        "204 Classroom",
+        "205 Classroom"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-26T23:45:00Z",
+      "nextEndAt": "2026-02-27T03:15:00Z"
+    },
+    {
+      "name": "Men's Morning TEAM",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Cafe"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-27T10:30:00Z",
+      "nextEndAt": "2026-02-27T12:30:00Z"
+    },
+    {
+      "name": "Women's Wellness Class: Breaking Free from Body Shame",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Nursery",
+        "Lobby"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-02-27T16:30:00Z",
+      "nextEndAt": "2026-02-27T18:00:00Z"
+    },
+    {
+      "name": "Junior High Youth Group",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "110 Classroom",
+        "111-112 Classroom",
+        "Gym",
+        "113-114 Classroom",
+        "201 - Mt. Laurel Room",
+        "204 Classroom",
+        "205 Classroom",
+        "The Prayer Garden"
+      ],
+      "lastSeenAt": "2026-02-21T00:00:00Z",
+      "nextAt": "2026-02-28T00:00:00Z",
+      "nextEndAt": "2026-02-28T02:15:00Z",
+      "lastEndAt": "2026-02-21T02:15:00Z"
+    },
+    {
+      "name": "High School Youth Group",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Cafe",
+        "Lobby",
+        "Sanctuary",
+        "Gym",
+        "111-112 Classroom",
+        "113-114 Classroom",
+        "201 - Mt. Laurel Room",
+        "110 Classroom",
+        "116 - Classroom",
+        "115 - Classroom",
+        "The Prayer Garden",
+        "Sand Volleyball Area"
+      ],
+      "lastSeenAt": "2026-02-21T00:00:00Z",
+      "nextAt": "2026-02-28T00:00:00Z",
+      "nextEndAt": "2026-02-28T04:00:00Z",
+      "lastEndAt": "2026-02-21T04:00:00Z"
+    },
+    {
+      "name": "Worship Service",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Sanctuary",
+        "Lobby",
+        "Nursery",
+        "Overflow Room - Left",
+        "Overflow Room - Right",
+        "113-114 Classroom",
+        "111-112 Classroom",
+        "201 - Mt. Laurel Room",
+        "110 Classroom",
+        "104 Classroom",
+        "103 Classroom",
+        "204 Classroom",
+        "205 Classroom",
+        "Cafe"
+      ],
+      "lastSeenAt": "2026-02-22T13:45:00Z",
+      "nextAt": "2026-03-01T13:45:00Z",
+      "nextEndAt": "2026-03-01T17:00:00Z",
+      "lastEndAt": "2026-02-22T17:00:00Z"
+    },
+    {
+      "name": "Romans Adult Class",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "116 - Classroom"
+      ],
+      "lastSeenAt": "2026-02-22T15:15:00Z",
+      "nextAt": "2026-03-01T15:15:00Z",
+      "nextEndAt": "2026-03-01T16:30:00Z",
+      "lastEndAt": "2026-02-22T16:30:00Z"
+    },
+    {
+      "name": "Financial Peace",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Sanctuary"
+      ],
+      "lastSeenAt": "2026-02-22T22:30:00Z",
+      "nextAt": "2026-03-01T22:30:00Z",
+      "nextEndAt": "2026-03-02T00:00:00Z",
+      "lastEndAt": "2026-02-23T00:00:00Z"
+    },
+    {
+      "name": "Lindow Community Group",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Cafe"
+      ],
+      "lastSeenAt": "2026-02-22T22:30:00Z",
+      "nextAt": "2026-03-01T22:30:00Z",
+      "nextEndAt": "2026-03-02T00:30:00Z",
+      "lastEndAt": "2026-02-23T00:30:00Z"
+    },
+    {
+      "name": "Rhythms Course",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Lobby",
+        "Overflow Room - Left",
+        "Overflow Room - Right"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-03-01T23:00:00Z",
+      "nextEndAt": "2026-03-02T01:00:00Z"
+    },
+    {
+      "name": "Men's Pickup Basketball",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Gym"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-03-02T21:30:00Z",
+      "nextEndAt": "2026-03-02T23:30:00Z"
+    },
+    {
+      "name": "Men\u2019s Monday Night Bible Study",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Sanctuary",
+        "Overflow Room - Right",
+        "115 - Classroom"
+      ],
+      "lastSeenAt": "2026-02-23T23:00:00Z",
+      "nextAt": "2026-03-02T23:00:00Z",
+      "nextEndAt": "2026-03-03T01:00:00Z",
+      "lastEndAt": "2026-02-24T01:00:00Z"
+    },
+    {
+      "name": "Chronically Ill community Group",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Overflow Room - Left"
+      ],
+      "lastSeenAt": "2026-02-23T23:30:00Z",
+      "nextAt": "2026-03-02T23:30:00Z",
+      "nextEndAt": "2026-03-03T01:00:00Z",
+      "lastEndAt": "2026-02-24T01:00:00Z"
+    },
+    {
+      "name": "Men\u2019s CR Step Study",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "116 - Classroom"
+      ],
+      "lastSeenAt": "2026-02-23T23:30:00Z",
+      "nextAt": "2026-03-02T23:30:00Z",
+      "nextEndAt": "2026-03-03T02:00:00Z",
+      "lastEndAt": "2026-02-24T02:00:00Z"
+    },
+    {
+      "name": "Missions Board meeting",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Conference Room"
+      ],
+      "lastSeenAt": null,
+      "nextAt": "2026-03-03T00:00:00Z",
+      "nextEndAt": "2026-03-03T02:00:00Z"
+    },
+    {
+      "name": "Board Meeting",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Cafe"
+      ],
+      "lastSeenAt": "2026-02-24T00:00:00Z",
+      "nextAt": null,
+      "nextEndAt": "2026-02-24T03:30:00Z",
+      "lastEndAt": "2026-02-24T03:30:00Z"
+    },
+    {
+      "name": "bball",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Gym"
+      ],
+      "lastSeenAt": "2026-02-23T21:30:00Z",
+      "nextAt": null,
+      "nextEndAt": "2026-02-23T23:30:00Z",
+      "lastEndAt": "2026-02-23T23:30:00Z"
+    },
+    {
+      "name": "Womens Scripture Prayer Group",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Whole Hope House"
+      ],
+      "lastSeenAt": "2026-02-23T15:00:00Z",
+      "nextAt": null,
+      "nextEndAt": "2026-02-23T16:30:00Z",
+      "lastEndAt": "2026-02-23T16:30:00Z"
+    },
+    {
+      "name": "Worship Team Meeting",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Lobby",
+        "Conference Room"
+      ],
+      "lastSeenAt": "2026-02-22T18:30:00Z",
+      "nextAt": null,
+      "nextEndAt": "2026-02-22T21:30:00Z",
+      "lastEndAt": "2026-02-22T21:30:00Z"
+    },
+    {
+      "name": "SALT community group",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "Cafe"
+      ],
+      "lastSeenAt": "2026-02-22T16:00:00Z",
+      "nextAt": null,
+      "nextEndAt": "2026-02-22T19:00:00Z",
+      "lastEndAt": "2026-02-22T19:00:00Z"
+    },
+    {
+      "name": "Baptism class",
+      "building": "Mount Laurel Campus",
+      "rooms": [
+        "115 - Classroom"
+      ],
+      "lastSeenAt": "2026-02-22T15:45:00Z",
+      "nextAt": null,
+      "nextEndAt": "2026-02-22T17:00:00Z",
+      "lastEndAt": "2026-02-22T17:00:00Z"
+    }
+  ],
+  "updatedAt": "2026-02-24T02:50:02.556495Z"
+}

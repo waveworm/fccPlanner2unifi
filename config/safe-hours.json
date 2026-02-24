@@ -1,0 +1,16 @@
+{
+  "safeStartMonday": "05:00",
+  "safeEndMonday": "23:00",
+  "safeStartTuesday": "05:00",
+  "safeEndTuesday": "23:00",
+  "safeStartWednesday": "05:00",
+  "safeEndWednesday": "23:00",
+  "safeStartThursday": "05:00",
+  "safeEndThursday": "23:00",
+  "safeStartFriday": "05:00",
+  "safeEndFriday": "23:30",
+  "safeStartSaturday": "05:00",
+  "safeEndSaturday": "23:00",
+  "safeStartSunday": "05:00",
+  "safeEndSunday": "23:00"
+}

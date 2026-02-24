@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/fccplanner2unifi
 EnvironmentFile=/root/fccplanner2unifi/.env
-ExecStart=/root/fccplanner2unifi/.venv/bin/python -m uvicorn py_app.main:app --host 0.0.0.0 --port 3000
+ExecStart=/root/fccplanner2unifi/.venv/bin/python -m uvicorn py_app.main:app --host $HOST --port $PORT
 Restart=always
 RestartSec=5
 
