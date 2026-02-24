@@ -19,6 +19,8 @@ It also supports **Office Hours** — a static recurring weekly schedule that un
 
 It also supports **Event Time Overrides** — per-event-name rules that replace the global lead/lag with exact clock times per door, optionally across two separate unlock windows per door. A door can also be suppressed (blocked) for a specific event while still opening normally for other events.
 
+It also supports an **Approval Gate** — events that start outside configured "safe hours" are held in a pending queue and require manual approval before their door schedule is applied. Events by pre-approved names bypass the gate automatically.
+
 The service runs as a **systemd service**, exposes a **FastAPI web dashboard** on port 3000, and syncs on a cron schedule (default: every 5 minutes).
 
 ---
@@ -48,16 +50,20 @@ fccplanner2unifi/
 │   ├── mapping.py                 # Builds desired door schedules from events + mapping config
 │   ├── office_hours.py            # Office hours config load/save/parse/build windows
 │   ├── event_overrides.py         # Event memory (seen events) + per-event door time overrides
+│   ├── approvals.py               # Approval gate: safe hours, pending queue, approve/deny logic
 │   ├── utils.py                   # Shared utilities (parse_iso)
 │   ├── logger.py                  # JSON-structured stdout logger
 │   └── vendors/
 │       ├── pco.py                 # Planning Center Online API client (async, with caching)
-│       └── unifi_access.py        # UniFi Access API client (async, schedule/policy management)
+│       └── unifi_access.py        # UniFi Access API client (async, schedule/policy/status management)
 ├── config/
 │   ├── room-door-mapping.json     # Maps PCO room names → UniFi door groups (EDIT THIS to configure rooms)
 │   ├── office-hours.json          # Weekly recurring office hours schedule (managed via /office-hours UI)
 │   ├── event-overrides.json       # Per-event-name door time overrides (managed via /event-overrides UI)
 │   ├── event-memory.json          # Rolling list of known PCO events (auto-updated by sync, never edit)
+│   ├── safe-hours.json            # Per-day safe hours windows for approval gate (managed via /general-settings)
+│   ├── pending-approvals.json     # Queue of events awaiting approval (auto-managed, never edit)
+│   ├── cancelled-events.json      # Events manually cancelled from the dashboard (auto-managed)
 │   └── sync-state.json            # Persisted apply/dry-run toggle state (auto-created, do not commit)
 ├── deploy/
 │   └── pco-unifi-sync.service     # systemd unit file
@@ -98,6 +104,8 @@ All settings are loaded by `py_app/settings.py` via Pydantic `BaseSettings`. Val
 | `UNIFI_ACCESS_BASE_URL` | _(required)_ | UniFi controller URL e.g. `https://192.168.59.9:12445` |
 | `UNIFI_ACCESS_VERIFY_TLS` | `false` | Whether to verify the UniFi TLS cert |
 | `UNIFI_ACCESS_AUTH_TYPE` | `none` | `api_token` or `none` |
+| `UNIFI_ACCESS_USERNAME` | _(empty)_ | Username for session-based auth |
+| `UNIFI_ACCESS_PASSWORD` | _(empty)_ | Password for session-based auth |
 | `UNIFI_ACCESS_API_TOKEN` | _(required if api_token)_ | API token value |
 | `UNIFI_ACCESS_API_KEY_HEADER` | `X-API-Key` | Header name for the token (use `Authorization` to send as Bearer) |
 | `APPLY_TO_UNIFI` | `false` | Startup default for apply mode (overridden by `config/sync-state.json` if present) |
@@ -109,19 +117,28 @@ All settings are loaded by `py_app/settings.py` via Pydantic `BaseSettings`. Val
 | `OFFICE_HOURS_FILE` | `./config/office-hours.json` | Path to office hours config |
 | `EVENT_OVERRIDES_FILE` | `./config/event-overrides.json` | Path to per-event door time overrides |
 | `EVENT_MEMORY_FILE` | `./config/event-memory.json` | Path to auto-managed event memory (seen events list) |
+| `CANCELLED_EVENTS_FILE` | `./config/cancelled-events.json` | Path to manually cancelled events list |
+| `PENDING_APPROVALS_FILE` | `./config/pending-approvals.json` | Path to approval queue |
+| `APPROVED_EVENT_NAMES_FILE` | `./config/approved-event-names.json` | Path to pre-approved event name list |
+| `SAFE_HOURS_FILE` | `./config/safe-hours.json` | Path to per-day safe hours config |
 | `DISPLAY_TIMEZONE` | `America/New_York` | Timezone for dashboard display AND for converting door schedule times |
+| `TELEGRAM_BOT_TOKEN` | _(empty)_ | Telegram bot token for approval notifications (optional) |
+| `TELEGRAM_CHAT_IDS` | _(empty)_ | Comma-separated Telegram chat IDs to notify |
+| `DOOR_STATUS_REFRESH_SECONDS` | `30` | How often the dashboard door status card auto-refreshes (0 = disabled) |
 
 ### `config/room-door-mapping.json`
 
 This is the primary configuration file. **Edit this to add/remove rooms or change which doors open for each room.**
 
+Current doors configured (in display order):
+
 ```json
 {
   "doors": {
-    "front_lobby": {
-      "label": "Front Lobby",
-      "unifiDoorIds": ["<uuid from UniFi>"]
-    }
+    "front_lobby": { "label": "Front Lobby",  "unifiDoorIds": ["b5f778e6-0c3a-49cd-8f4f-06a7011ee8cd"] },
+    "rear_lobby":  { "label": "Rear Lobby",   "unifiDoorIds": ["cdf39816-e069-4b4f-8972-918ca1ac9604"] },
+    "office":      { "label": "Office",       "unifiDoorIds": ["3dac1155-e5f8-47c3-96e6-d89c914491f6"] },
+    "gym_front":   { "label": "Gym Front",    "unifiDoorIds": ["38357452-65f5-4d3e-babc-6e34ce0aa4f7"] }
   },
   "rooms": {
     "Sanctuary": ["front_lobby", "rear_lobby"],
@@ -133,24 +150,24 @@ This is the primary configuration file. **Edit this to add/remove rooms or chang
   },
   "rules": {
     "excludeDoorKeysByEventName": [
-      {
-        "eventNameContains": "worship service",
-        "doorKeys": ["gym_front"]
-      }
-    ]
+      { "eventNameContains": "worship service", "doorKeys": ["gym_front"] }
+    ],
+    "excludeEventsByRoomContains": ["1520 Hainesport Rd"]
   }
 }
 ```
 
-- **`doors`**: defines every physical door group. Each key is a slug (`front_lobby`), `unifiDoorIds` is a list of UniFi door UUIDs.
+- **`doors`**: defines every physical door group. Each key is a slug (`front_lobby`), `unifiDoorIds` is a list of UniFi door UUIDs. **The order of keys determines the display order and color assignment** in the door status card and schedule timeline.
 - **`rooms`**: maps PCO room names (exactly as they appear in PCO resource bookings) to a list of door keys.
 - **`defaults`**: minutes before/after each event to keep doors unlocked.
 - **`rules.excludeDoorKeysByEventName`**: array of rules that prevent specific doors from unlocking for matching events. Matching is case-insensitive substring.
-- **`rules.excludeEventsByRoomContains`**: array of substring strings. Any event whose `room` field (the PCO resource-booking room name) contains any of these strings (case-insensitive) is completely excluded from the sync. Example use: `"1520 Hainesport Rd"` filters out away/off-site placeholder events that have no real resource bookings and fall back to using the campus address as their room name.
+- **`rules.excludeEventsByRoomContains`**: array of substring strings. Any event whose `room` field contains any of these strings (case-insensitive) is completely excluded from the sync.
 
 **Important:** Room names must exactly match what PCO returns in resource booking `name` fields (case-sensitive). If an event has no resource bookings, it falls back to the `location` field.
 
-**Important:** For every door key used here, a UniFi Access schedule named exactly `PCO Sync {door_key}` (e.g. `PCO Sync front_lobby`) **must be pre-created in the UniFi UI**. The sync service will update that schedule's time windows but will NOT auto-create new schedules. This is intentional.
+**Important:** For every door key that will receive office hours windows, a UniFi Access schedule named exactly `PCO Sync {door_key}` (e.g. `PCO Sync office`) **must be pre-created in the UniFi UI**. The sync service will update that schedule's time windows but will NOT auto-create new schedules.
+
+**Note:** The `office` door is not mapped to any PCO rooms — it is only used via Office Hours. It still appears in the door status card and schedule timeline.
 
 ### `config/office-hours.json`
 
@@ -158,11 +175,11 @@ Managed via the `/office-hours` web page. Do not edit by hand unless necessary.
 
 ```json
 {
-  "enabled": false,
+  "enabled": true,
   "schedule": {
-    "monday":    { "ranges": "9:00-17:00", "doors": ["front_lobby"] },
-    "tuesday":   { "ranges": "9:00-17:00", "doors": ["front_lobby"] },
-    "wednesday": { "ranges": "", "doors": [] },
+    "monday":    { "ranges": "9:00-11:00", "doors": ["rear_lobby", "office"] },
+    "tuesday":   { "ranges": "", "doors": [] },
+    "wednesday": { "ranges": "9:00-11:00", "doors": ["rear_lobby", "office"] },
     ...
   }
 }
@@ -173,6 +190,31 @@ Managed via the `/office-hours` web page. Do not edit by hand unless necessary.
 - **`schedule.<day>.doors`**: list of door keys (must exist in `room-door-mapping.json`).
 
 Office hours windows are **merged with PCO event windows** before being applied to UniFi. The same `PCO Sync {door_key}` UniFi schedule gets both event-based and office-hours-based time windows combined.
+
+### `config/safe-hours.json`
+
+Managed via the `/general-settings` web page. Defines per-day windows during which events are automatically approved. Events starting outside these windows are held for manual approval.
+
+```json
+{
+  "safeStartMonday": "05:00",  "safeEndMonday": "23:00",
+  "safeStartTuesday": "05:00", "safeEndTuesday": "23:00",
+  ...
+  "safeStartFriday": "05:00",  "safeEndFriday": "23:30",
+  "safeStartSaturday": "05:00","safeEndSaturday": "23:00",
+  "safeStartSunday": "05:00",  "safeEndSunday": "23:00"
+}
+```
+
+All times are in `DISPLAY_TIMEZONE`. An event is flagged if its start time falls outside `[safeStart{Day}, safeEnd{Day}]` on the day it occurs.
+
+### `config/pending-approvals.json`
+
+Auto-managed by the approval system. **Never edit by hand.** Contains events that have been flagged as outside safe hours and are awaiting approval or denial. Pruned automatically when events expire.
+
+### `config/cancelled-events.json`
+
+Auto-managed when events are manually cancelled from the dashboard. Contains a list of `{id, name, startAt, endAt}` entries. Cancelled events are excluded from sync and shown in a warning card on the dashboard. Can be restored from the dashboard.
 
 ### `config/event-overrides.json`
 
@@ -189,9 +231,7 @@ Managed via the `/event-overrides` web page. Per-event-name door time overrides.
             { "openTime": "21:15", "closeTime": "21:45" }
           ]
         },
-        "front_lobby": {
-          "windows": []
-        }
+        "front_lobby": { "windows": [] }
       }
     }
   }
@@ -202,13 +242,12 @@ Managed via the `/event-overrides` web page. Per-event-name door time overrides.
 - **`doorOverrides`**: a map of door key → override config.
 - **`windows`**: array of `{openTime, closeTime}` pairs in `HH:MM` format (24h, `DISPLAY_TIMEZONE`).
   - One or two windows per door (supports split entry/exit windows).
-  - `windows: []` (empty array) means **suppress** — this event will not open this door at all. Other events that use the same door are completely unaffected.
+  - `windows: []` (empty array) means **suppress** — this event will not open this door at all.
 - Doors **not listed** in `doorOverrides` use the global `unlockLeadMinutes`/`unlockLagMinutes` defaults.
-- An event name **not listed** in `overrides` uses only global defaults.
 
 ### `config/event-memory.json`
 
-Auto-managed by the sync service. **Never edit by hand.** Populated on every sync, pruned automatically. Used to drive the `/event-overrides` UI event table.
+Auto-managed by the sync service. **Never edit by hand.** Used to drive the `/event-overrides` UI event table.
 
 ```json
 {
@@ -227,23 +266,11 @@ Auto-managed by the sync service. **Never edit by hand.** Populated on every syn
 }
 ```
 
-- **`name`**: exact event name as returned by PCO.
-- **`lastSeenAt`**: most recent past `startAt` ever observed for this event name.
-- **`lastEndAt`**: `endAt` of the most recent past occurrence (used to compute default door close time in the UI).
-- **`nextAt`**: nearest upcoming `startAt` (null when no future occurrence is in the sync window).
-- **`nextEndAt`**: `endAt` of the nearest upcoming occurrence (used to compute default door close time in the UI).
-- **Pruning**: entries where `lastSeenAt` > 60 days ago AND `nextAt` is null are automatically removed.
-- Sorted: upcoming events first (soonest), then past events by most recent.
-
-Do not commit this file.
+Pruning: entries where `lastSeenAt` > 60 days ago AND `nextAt` is null are automatically removed. Do not commit this file.
 
 ### `config/sync-state.json`
 
-Auto-created when the apply/dry-run mode is toggled on the dashboard. Persists the mode across service restarts. Format:
-```json
-{ "applyToUnifi": true }
-```
-Do not commit this file. Add it to `.gitignore`.
+Auto-created when the apply/dry-run mode is toggled on the dashboard. Persists the mode across service restarts. Format: `{ "applyToUnifi": true }`. Do not commit this file.
 
 ---
 
@@ -265,10 +292,11 @@ All pages are served inline as HTML from `py_app/main.py` (no separate template 
 | URL | Description |
 |---|---|
 | `/` | Redirects to `/dashboard` |
-| `/dashboard` | Main status page: last sync, PCO/UniFi status, errors, stats, event preview table, sync/mode buttons |
+| `/dashboard` | Main status page: door status card, approval queue, upcoming events, sync controls |
 | `/settings` | Room → Door mapping editor (checkbox grid) |
 | `/office-hours` | Office hours schedule editor (7 rows × door checkboxes + time range text inputs) |
-| `/event-overrides` | Event time overrides — table of all known events (from memory), inline override editor per event |
+| `/event-overrides` | Event time overrides — table of all known events, inline override editor per event |
+| `/general-settings` | Approval gate config: safe hours per day, approved event names, notification settings |
 | `/health` | `{"ok": true}` health check |
 
 ### API Endpoints
@@ -281,15 +309,27 @@ All pages are served inline as HTML from `py_app/main.py` (no separate template 
 | `POST` | `/api/sync/run` | Trigger an immediate sync cycle |
 | `GET` | `/api/preview` | Preview what next sync would apply (JSON) |
 | `GET` | `/api/events/upcoming` | Upcoming events list |
+| `GET` | `/api/events/cancelled` | List of manually cancelled events |
+| `POST` | `/api/events/cancel` | Cancel an event: `{"id", "name", "startAt", "endAt"}` |
+| `POST` | `/api/events/restore` | Restore a cancelled event: `{"id"}` |
+| `GET` | `/api/approvals/pending` | List events in the approval queue |
+| `POST` | `/api/approvals/approve` | Approve a pending event: `{"id"}` |
+| `POST` | `/api/approvals/deny` | Deny a pending event: `{"id"}` |
 | `GET` | `/api/mapping` | Read room-door mapping JSON |
 | `POST` | `/api/mapping` | Save room-door mapping JSON (validated before write) |
 | `GET` | `/api/office-hours` | Read office hours config JSON |
 | `POST` | `/api/office-hours` | Save office hours config JSON (validated before write) |
 | `GET` | `/api/event-overrides` | Read event-overrides config JSON |
 | `POST` | `/api/event-overrides` | Save event-overrides config JSON (validated before write) |
-| `GET` | `/api/event-memory` | Read event-memory JSON (read-only; written by sync service) |
+| `GET` | `/api/event-memory` | Read event-memory JSON (read-only) |
+| `GET` | `/api/general-settings` | Read safe hours + notification settings |
+| `POST` | `/api/general-settings` | Save safe hours + approved event names |
+| `POST` | `/api/system-settings` | Save system-level `.env` settings (port, credentials, etc.) |
 | `GET` | `/api/unifi/ping` | Test UniFi connectivity |
-| `GET` | `/api/unifi/doors` | Probe UniFi for door list |
+| `GET` | `/api/unifi/doors` | Probe UniFi for full door list |
+| `GET` | `/api/unifi/door-status` | Live lock/position status for all configured door groups |
+| `POST` | `/api/unifi/door/{door_id}/lock` | Send lock command to a specific UniFi door |
+| `GET` | `/api/door-schedule` | Per-door unlock windows (local day + minutes) for the current sync window |
 | `GET` | `/api/pco/calendars` | List PCO calendars |
 | `GET` | `/api/pco/event-instances/sample` | Raw sample of PCO event_instances |
 
@@ -314,6 +354,12 @@ SyncService.run_once()
   │         _get_instance_room_names() # separate API call per event for resource bookings
   │
   ├─ _filter_events_in_window()        # applies PCO_LOCATION_MUST_CONTAIN filter
+  │
+  ├─ _apply_mapping_exclusions()       # excludeEventsByRoomContains rules
+  │
+  ├─ _filter_cancelled_events()        # removes manually cancelled events
+  │
+  ├─ filter_and_flag_events()          # approvals.py — flags after-hours events, returns approved subset
   │
   ├─ update_event_memory()             # event_overrides.py — updates config/event-memory.json
   │
@@ -347,10 +393,12 @@ SyncService.run_once()
 - Defines all routes as closures inside the factory (so they share `settings`, `sync_service`, etc.)
 - Renders all HTML inline using f-strings + `html.escape()` for safety
 - The `app = create_app()` at the bottom is what uvicorn imports
-- Uses deprecated `@app.on_event("startup/shutdown")` — should be migrated to `lifespan` context manager in a future cleanup
-- `_SHARED_CSS`: module-level plain Python string constant (not an f-string) containing all shared CSS. Embedded in each page via `{_SHARED_CSS}` in the f-string. Using a plain string avoids having to double-escape CSS `{}` braces.
-- `_nav(active)`: helper function inside `create_app()` that generates the dark site header HTML with nav links. `active` is the page key (`"dashboard"`, `"settings"`, `"office-hours"`, `"event-overrides"`).
-- Dashboard page layout: status bar (PCO/UniFi dots + last sync + mode badge + action buttons), Upcoming Events card (always visible), then collapsible sections (collapsed by default) for: Sync Details, Recent Errors, PCO API Stats, Sync Configuration, Room→Door Mapping.
+- `_SHARED_CSS`: module-level plain Python string constant (not an f-string) containing all shared CSS
+- `_DOOR_COLORS`: module-level list of hex colors assigned to door keys in mapping order — `["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899"]`. Used both server-side (events table door label coloring) and client-side (schedule timeline bars). **The color for a door key is determined by its position in `config/room-door-mapping.json`'s `doors` object.**
+- `_nav(active)`: helper that generates the dark site header HTML with nav links
+- Dashboard page layout: Door Status card → Pending Approvals card → Upcoming Events card → collapsible sections (Sync Details, Recent Errors, PCO API Stats, Sync Configuration, Room→Door Mapping)
+- Dashboard Door Status card: legend showing each door's color square + name + lock status badge (Locked/Unlocked, clickable to lock when unlocked) + position badge (Door Open/Door Closed from sensor). Below the legend: a compact weekly timeline grid (Mon–Sun rows, stacked thin bars per door, alternating row backgrounds). Clicking the grid opens a full modal with larger bars and time labels. Auto-refreshes every `DOOR_STATUS_REFRESH_SECONDS`.
+- Events table: Door Group(s) column renders each door label in its assigned `_DOOR_COLORS` color.
 
 **`py_app/settings.py`**
 - Single `Settings` class using `pydantic_settings.BaseSettings`
@@ -360,49 +408,50 @@ SyncService.run_once()
 **`py_app/sync_service.py`**
 - `SyncService` class holds all in-memory state: last sync result, PCO/UniFi status, error log, apply mode flag
 - `run_once()` is the main sync method called by the scheduler and the manual trigger endpoint
-- `get_preview()` / `get_upcoming_preview()` build the schedule without applying it (used by dashboard and `/api/preview`)
-- `get_upcoming_preview()` uses a **fixed 24h lookback** (not `SYNC_LOOKBEHIND_HOURS`) so PCO's `starts_at[gte]` filter doesn't hide events that started earlier in the day. Also filters out events whose `endAt` has already passed, keeping only current or upcoming events.
-- `_filter_events_in_window()`: includes **in-progress events** (started before the window but `endAt > now`). This ensures an event that started 3 hours ago and runs until 11 PM stays visible on the dashboard.
-- `_apply_mapping_exclusions()`: filters events by checking `e["room"]` (the resource-booking room name, or fallback address for events with no bookings) against `rules.excludeEventsByRoomContains` patterns. **Important:** checks `e["room"]` only — never `locationRaw`. The `locationRaw` field is the same for all events at the same campus and cannot be used for discrimination.
-- Apply mode is persisted to `config/sync-state.json` on every toggle via `_save_apply_state()`
+- `get_preview()` builds the schedule without applying it (used by dashboard and `/api/preview`)
+- `get_upcoming_preview()` uses a fixed 24h lookback; filters out events whose `endAt` has already passed
+- `_filter_events_in_window()`: includes in-progress events (started before window but `endAt > now`)
+- `_apply_mapping_exclusions()`: filters by `e["room"]` against `excludeEventsByRoomContains`. Never uses `locationRaw`.
+- `_filter_cancelled_events()`: removes events whose ID appears in `cancelled-events.json`
+- Apply mode persisted to `config/sync-state.json` via `_save_apply_state()`
+
+**`py_app/approvals.py`**
+- `load_safe_hours(file_path)`: loads per-day safe hours from `safe-hours.json`. Keys: `safeStart{Day}` and `safeEnd{Day}` for all 7 days. Backward-compatible with old single-field format.
+- `is_outside_safe_hours(event, safe_hours, local_tz)`: returns `(bool, reason_str)` — true if the event's start time falls outside the configured window for that day of week.
+- `filter_and_flag_events(events, pending_file, approved_names_file, safe_hours_file, local_tz)`: the main gate function. For each event: if name is pre-approved → pass through; if within safe hours → pass through (and clear any stale pending entry); if outside safe hours → add to pending queue and exclude from approved list.
+- `approve_pending(pending_file, approved_names_file, event_id)`: moves event from pending queue to approved names list.
+- `deny_pending(pending_file, event_id)`: removes event from pending queue (it will be re-evaluated next sync and re-flagged if still outside safe hours).
+- **Auto-clear**: when an event passes the safe hours check or is auto-approved by name, any stale pending entry for that event ID is automatically removed so the approval card doesn't show stale items.
 
 **`py_app/mapping.py`**
 - Pure functions, no I/O except `load_room_door_mapping()` which reads a file
-- `build_desired_schedule(events, mapping, now_iso, overrides, local_tz)` is the core algorithm — takes events + mapping config + optional overrides, returns `{items, doorWindows}`
-- For each event × door: calls `find_door_override()`. If override found with windows → uses exact times (supports 2 windows). If override with `windows: []` → suppresses that door for that event. If no override → uses default lead/lag.
-- `_merge_windows()` merges overlapping time windows for a single door (sorted by start, greedy merge)
-- `items` = one entry per event-room-door combination (used for display)
-- `doorWindows` = merged time windows per door (used for UniFi application)
+- `build_desired_schedule(events, mapping, now_iso, overrides, local_tz)` → `{items, doorWindows}`
+- `_merge_windows()` merges overlapping time windows per door (sorted, greedy merge)
 
 **`py_app/office_hours.py`**
 - `parse_time_ranges()` handles flexible time string parsing (regex-based, silently skips invalid)
 - `build_office_hours_windows()` generates door windows by iterating dates in the sync window
-- `merge_office_hours_into_desired()` combines office hours windows with PCO event windows and re-runs `_merge_windows()` per door
+- `merge_office_hours_into_desired()` combines office hours windows with PCO event windows
 
 **`py_app/event_overrides.py`**
-- `load_event_memory(file_path)` / `update_event_memory(file_path, events, local_tz)`: rolling list of all PCO event names seen across syncs. Groups by event name (case-insensitive), tracks `lastSeenAt`/`lastEndAt` (most recent past occurrence + end time) and `nextAt`/`nextEndAt` (nearest future occurrence + end time). Prunes entries > 60 days old with no upcoming occurrence.
-- The `nextEndAt`/`lastEndAt` fields are critical for the `/event-overrides` UI: they let the edit panel show the default door open/close times based on the actual event duration.
-- `load_event_overrides(file_path)` / `save_event_overrides()` / `validate_event_overrides()`: load/save/validate the overrides config.
-- `find_door_override(event_name, door_key, overrides)`: case-insensitive lookup. Returns `{"windows": [...]}` dict or `None` if no override for this event+door combination.
+- `load_event_memory()` / `update_event_memory()`: rolling list of PCO event names. Tracks `lastSeenAt`/`lastEndAt` and `nextAt`/`nextEndAt` per event name.
+- `load_event_overrides()` / `save_event_overrides()` / `validate_event_overrides()`
+- `find_door_override(event_name, door_key, overrides)`: case-insensitive lookup
 
 **`py_app/utils.py`**
-- `parse_iso(value)`: shared ISO-8601 → UTC datetime parser. Used by `mapping.py`, `sync_service.py`, `event_overrides.py`. Always returns UTC-aware datetime or None.
+- `parse_iso(value)`: shared ISO-8601 → UTC datetime parser
 
 **`py_app/vendors/pco.py`**
-- `PcoClient`: async httpx client for PCO API
-- Caches results by normalized time window (truncated to minute precision)
-- Tracks stats: cache hits, live fetches, 429 fallbacks (viewable on dashboard)
-- `get_events()` makes one API call per page + one `resource_bookings` call per event instance — for large calendars this can be many requests; the caching mitigates this
-- `_get_instance_room_names()`: fetches resource bookings for a single event instance, returns room names. Returns `[]` silently on any error.
+- `PcoClient`: async httpx client for PCO API with caching and 429 fallback
+- `get_events()`: paginated fetch + per-event resource booking calls
+- `_get_instance_room_names()`: fetches resource bookings for one event instance
 
 **`py_app/vendors/unifi_access.py`**
 - `UnifiAccessClient`: async httpx client for UniFi Access API
-- `apply_desired_schedule()`: the only write path. For each door group:
-  1. Finds the pre-existing schedule named `PCO Sync {door_key}` — **raises RuntimeError if not found** (intentional: prevents auto-creating schedules)
-  2. Builds weekly schedule from UTC windows (converted to `DISPLAY_TIMEZONE` local time)
-  3. PUTs the schedule only if it differs from existing
-  4. DELETEs old policy if resources changed, POSTs new policy
-- `_build_week_schedule()`: converts list of UTC datetime windows → `{monday: [{start_time, end_time}], ...}` using `DISPLAY_TIMEZONE`
+- `apply_desired_schedule()`: the only write path — finds `PCO Sync {door_key}` schedule (raises RuntimeError if not found), builds weekly schedule, PUTs if changed, manages access policies
+- `_build_week_schedule()`: converts UTC windows → `{monday: [{start_time, end_time}], ...}` in `DISPLAY_TIMEZONE`
+- `get_door_statuses(door_ids)`: calls `GET /api/v1/developer/doors`, returns `{door_id: {status, name, position}}`. Normalizes UniFi's `"LOCK"/"UNLOCK"` → `"LOCKED"/"UNLOCKED"` and `"CLOSE"` → `"CLOSED"`.
+- `lock_door(door_id)`: sends lock command via multiple candidate API paths with fallback
 - `list_doors()`: probes multiple candidate paths since UniFi's API surface varies by version
 
 **`py_app/logger.py`**
@@ -417,6 +466,7 @@ Before the service can apply any schedules, you must **manually create schedules
 ```
 PCO Sync front_lobby
 PCO Sync rear_lobby
+PCO Sync office
 PCO Sync gym_front
 ```
 
@@ -425,6 +475,8 @@ PCO Sync gym_front
 The service will update the time windows in those schedules but will never create new ones. This is intentional to prevent accidental schedule proliferation.
 
 You also do not need to create access policies manually — the service creates/updates a policy named `PCO Sync Policy {door_key}` for each door group automatically.
+
+**Note on the `office` door:** The `office` door is not mapped to any PCO rooms. Its UniFi schedule (`PCO Sync office`) will only receive windows from the Office Hours configuration, not from PCO events. The schedule still needs to exist in UniFi for the sync to succeed when office hours are active for that door.
 
 ---
 
@@ -482,33 +534,50 @@ The room name must match exactly what PCO returns in resource bookings.
 
 ### Adding a new physical door
 
-1. Get the UniFi door UUID from the UniFi UI or `GET /api/unifi/doors`
-2. Add to `config/room-door-mapping.json` → `"doors"`:
+1. Get the UniFi door UUID from `GET /api/unifi/doors`
+2. Add to `config/room-door-mapping.json` → `"doors"` (in the desired display position):
    ```json
    "new_door_key": { "label": "Human Label", "unifiDoorIds": ["<uuid>"] }
    ```
 3. Create a schedule named `PCO Sync new_door_key` in the UniFi Access UI
-4. Map rooms to it as needed
+4. Map rooms to it as needed in `"rooms"` (optional — a door can exist just for office hours)
+5. The door will automatically appear in the dashboard door status card and schedule timeline
+
+### Changing door display order or colors
+
+Door order and color assignment are both determined by the key order in `config/room-door-mapping.json` → `"doors"`. Colors cycle through `_DOOR_COLORS` in `main.py`: blue, amber, green, red, purple, pink. Reordering the keys changes both the display order and color assignments simultaneously.
 
 ### Adding a door exclusion rule (by event name)
 
-To prevent a specific door from opening for events whose name contains a substring, in `config/room-door-mapping.json` → `"rules"`:
 ```json
 "excludeDoorKeysByEventName": [
   { "eventNameContains": "worship service", "doorKeys": ["gym_front"] }
 ]
 ```
-Matching is case-insensitive substring (not exact match).
+Matching is case-insensitive substring.
 
 ### Excluding events entirely (by room name)
 
-To completely ignore certain events from sync (e.g., placeholder away-events that have no real room bookings), add to `config/room-door-mapping.json` → `"rules"`:
 ```json
-"excludeEventsByRoomContains": [
-  "1520 Hainesport Rd"
-]
+"excludeEventsByRoomContains": ["1520 Hainesport Rd"]
 ```
-An event is excluded if its `room` field (resource-booking room name, or fallback address for events with no bookings) contains any of these strings (case-insensitive). **Never use `locationRaw` for this** — it is the same full campus address for every event at the campus and would exclude everything.
+An event is excluded if its `room` field contains any of these strings. Never use `locationRaw` for this.
+
+### Configuring the approval gate
+
+Navigate to `/general-settings`. Set per-day safe hours start and end times. Events starting outside those windows are held in the pending queue on the dashboard. Add event names to the "pre-approved" list to bypass the gate entirely for recurring trusted events.
+
+### Adding a pre-approved event name
+
+On the `/general-settings` page, add the exact event name to the approved list. Or directly edit `config/approved-event-names.json`:
+```json
+["Sunday Service", "Staff Meeting"]
+```
+Matching is case-insensitive.
+
+### Setting per-event door time overrides
+
+Navigate to `/event-overrides`. The table shows all PCO events seen in the last 60 days. Click **Set Override** or **Edit** on any row.
 
 ### Changing the sync interval
 
@@ -520,46 +589,16 @@ Edit `config/room-door-mapping.json` → `"defaults"`:
 ```json
 "defaults": { "unlockLeadMinutes": 15, "unlockLagMinutes": 15 }
 ```
-These apply globally. Use the `/event-overrides` page to set exact per-event times for specific doors.
-
-### Setting per-event door time overrides
-
-Navigate to `/event-overrides`. The table shows all PCO events seen in the last 60 days (populated automatically after each sync). Click **Set Override** or **Edit** on any row. In the edit panel:
-
-- **Checked + times filled** → door opens at those exact clock times for this event (up to 2 separate windows per door, e.g. entry 6:45–7:30 and exit 8:45–9:15)
-- **Checked + times blank** → door is suppressed for this event only; other events that use the same door are unaffected
-- **Unchecked** → door uses the global lead/lag default
-
-The override is keyed by exact event name (case-insensitive match). It applies to every future occurrence of that event name.
-
-Data file: `config/event-overrides.json`. Format:
-```json
-{
-  "overrides": {
-    "Junior High Youth Group": {
-      "doorOverrides": {
-        "gym_front": {
-          "windows": [
-            { "openTime": "18:40", "closeTime": "19:20" },
-            { "openTime": "21:15", "closeTime": "21:45" }
-          ]
-        },
-        "front_lobby": { "windows": [] }
-      }
-    }
-  }
-}
-```
 
 ### Changing the timezone
 
-Set `DISPLAY_TIMEZONE` in `.env` (e.g. `America/Chicago`). This controls both the dashboard display timezone and the timezone used when converting UTC windows to UniFi's weekly `HH:MM:SS` format. Restart required.
+Set `DISPLAY_TIMEZONE` in `.env`. Restart required.
 
 ---
 
 ## Key Design Decisions & Constraints
 
-1. **No database.** All state is in memory (sync status, errors) or flat JSON files (mapping, office hours, sync state). This keeps deployment simple.
+1. **No database.** All state is in memory (sync status, errors) or flat JSON files (mapping, office hours, sync state, approvals). This keeps deployment simple.
 
 2. **UniFi schedules must be pre-created.** The service refuses to auto-create UniFi schedules. This prevents it from accumulating orphaned schedules and makes the UniFi side auditable.
 
@@ -569,9 +608,15 @@ Set `DISPLAY_TIMEZONE` in `.env` (e.g. `America/Chicago`). This controls both th
 
 5. **Office hours merge into PCO sync schedules.** There are no separate "office hours" schedules in UniFi. Both PCO event windows and office hours windows are combined and applied to the same `PCO Sync {door_key}` schedule.
 
-6. **PCO API rate limiting handled gracefully.** On HTTP 429, the client falls back to the most recent cached result for that time window and increments a `pco429FallbackReturns` counter visible on the dashboard.
+6. **PCO API rate limiting handled gracefully.** On HTTP 429, the client falls back to the most recent cached result for that time window and increments a counter visible on the dashboard.
 
-7. **Per-event resource booking requests.** For every event instance fetched, a separate PCO API call is made to get its resource bookings (room names). This is O(n) API calls per sync. The result is cached for the full window TTL, so repeated syncs within the cache window make zero live API calls.
+7. **Per-event resource booking requests.** For every event instance fetched, a separate PCO API call is made to get its resource bookings. This is O(n) API calls per sync. The result is cached for the full window TTL.
+
+8. **Approval gate is non-blocking.** A denied or pending event is simply excluded from that sync cycle. On the next sync it is re-evaluated — if it now falls within safe hours (or was approved), it passes through. Deny does not permanently block an event.
+
+9. **Door status is read-only except for lock.** The dashboard can read live lock/position status and send a lock command. It cannot unlock doors — that is intentional to prevent accidental unlocking from the web UI.
+
+10. **Door color assignment is order-based.** `_DOOR_COLORS` in `main.py` assigns colors by the position of door keys in `room-door-mapping.json`. Reordering keys changes colors. If colors need to be stable, do not reorder the `doors` object.
 
 ---
 
@@ -587,4 +632,3 @@ Set `DISPLAY_TIMEZONE` in `.env` (e.g. `America/Chicago`). This controls both th
 | `python-dotenv` | `.env` loading fallback |
 | `apscheduler` | Cron/interval job scheduler |
 | `Jinja2` | Installed as FastAPI transitive dep; not yet used for templates |
-s
