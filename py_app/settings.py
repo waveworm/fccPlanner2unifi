@@ -48,3 +48,5 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_ids: str = Field(default="", alias="TELEGRAM_CHAT_IDS")  # comma-separated
+
+    door_status_refresh_seconds: int = Field(default=30, alias="DOOR_STATUS_REFRESH_SECONDS")

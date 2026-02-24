@@ -1,10 +1,11 @@
 {
-  "enabled": false,
+  "enabled": true,
   "schedule": {
     "monday": {
-      "ranges": "5:00-6:00",
+      "ranges": "9:00-11:00",
       "doors": [
-        "gym_front"
+        "rear_lobby",
+        "office"
       ]
     },
     "tuesday": {
@@ -12,8 +13,11 @@
       "doors": []
     },
     "wednesday": {
-      "ranges": "",
-      "doors": []
+      "ranges": "9:00-11:00",
+      "doors": [
+        "rear_lobby",
+        "office"
+      ]
     },
     "thursday": {
       "ranges": "",

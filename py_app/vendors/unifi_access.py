@@ -229,6 +229,91 @@ class UnifiAccessClient:
 
         return week_schedule
 
+    async def get_door_statuses(self, door_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return {door_id: {status, name, position}} for each requested UniFi door ID.
+
+        status   : "LOCKED" | "UNLOCKED" | "UNKNOWN"
+        position : "OPEN"   | "CLOSED"   | "UNKNOWN"   (physical door sensor)
+        name     : human-readable label from UniFi
+        """
+        result: dict[str, dict[str, Any]] = {
+            d: {"status": "UNKNOWN", "name": d, "position": "UNKNOWN"} for d in door_ids
+        }
+        if not door_ids:
+            return result
+        try:
+            async with httpx.AsyncClient(
+                base_url=str(self.settings.unifi_access_base_url),
+                timeout=10.0,
+                verify=self.settings.unifi_access_verify_tls,
+            ) as client:
+                resp = await client.get(
+                    "/api/v1/developer/doors", headers=self._auth_headers()
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                doors = payload.get("data") or []
+                if isinstance(doors, list):
+                    for door in doors:
+                        did = str(door.get("id") or "")
+                        if did not in result:
+                            continue
+                        raw_status = str(door.get("door_lock_relay_status") or "UNKNOWN").upper()
+                        raw_pos    = str(door.get("door_position_status")    or "UNKNOWN").upper()
+                        result[did] = {
+                            # Normalise short forms returned by some firmware versions
+                            "status": {"LOCK": "LOCKED", "UNLOCK": "UNLOCKED"}.get(raw_status, raw_status),
+                            "name": str(door.get("name") or door.get("full_name") or did),
+                            "position": {"CLOSE": "CLOSED"}.get(raw_pos, raw_pos),
+                        }
+        except Exception:
+            pass  # Return UNKNOWN for all on any error
+        return result
+
+    async def lock_door(self, door_id: str) -> None:
+        """Force-lock a door immediately, overriding any active unlock schedule.
+
+        Tries multiple candidate API shapes since the exact endpoint varies by
+        UniFi Access firmware version.
+        """
+        async with httpx.AsyncClient(
+            base_url=str(self.settings.unifi_access_base_url),
+            timeout=10.0,
+            verify=self.settings.unifi_access_verify_tls,
+        ) as client:
+            candidates = [
+                # Firmware 2.x / developer API
+                ("PUT",  f"/api/v1/developer/doors/{door_id}", {"door_guard": "KEEP_LOCK"}),
+                # Alternative field name seen in some versions
+                ("PUT",  f"/api/v1/developer/doors/{door_id}", {"keep_door_locked": True}),
+                # Action-style endpoint
+                ("POST", f"/api/v1/developer/doors/{door_id}/lock", {}),
+                # Older style
+                ("PUT",  f"/api/v1/developer/doors/{door_id}/overrides",
+                 {"door_position_status": "LOCK"}),
+            ]
+            last_err = "No candidates tried"
+            for method, path, body in candidates:
+                try:
+                    if method == "PUT":
+                        resp = await client.put(
+                            path, headers=self._auth_headers(), json=body
+                        )
+                    else:
+                        resp = await client.post(
+                            path, headers=self._auth_headers(), json=body
+                        )
+                    if resp.status_code < 300:
+                        return
+                    last_err = (
+                        f"{method} {path} → HTTP {resp.status_code}: {resp.text[:200]}"
+                    )
+                except Exception as e:
+                    last_err = f"{method} {path} → {type(e).__name__}: {e}"
+            raise RuntimeError(
+                f"Could not lock door {door_id}. Last error: {last_err}"
+            )
+
     async def apply_desired_schedule(self, desired: dict[str, Any]) -> None:
         door_windows = desired.get("doorWindows") or []
         if not isinstance(door_windows, list) or not door_windows:

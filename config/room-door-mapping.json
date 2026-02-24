@@ -12,6 +12,12 @@
         "cdf39816-e069-4b4f-8972-918ca1ac9604"
       ]
     },
+    "office": {
+      "label": "Office",
+      "unifiDoorIds": [
+        "3dac1155-e5f8-47c3-96e6-d89c914491f6"
+      ]
+    },
     "gym_front": {
       "label": "Gym Front",
       "unifiDoorIds": [

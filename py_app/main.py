@@ -188,6 +188,9 @@ a:hover { text-decoration: underline; }
 """
 
 
+_DOOR_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899"]
+
+
 def create_app() -> FastAPI:
     settings = Settings()
     logger = get_logger()
@@ -256,6 +259,102 @@ def create_app() -> FastAPI:
     @app.get("/api/unifi/doors")
     async def api_unifi_doors() -> dict:
         return await unifi_client.list_doors()
+
+    @app.get("/api/unifi/door-status")
+    async def api_unifi_door_status() -> dict:
+        """Return live lock status for every configured door group."""
+        mapping = _read_mapping()
+        doors_cfg: dict = mapping.get("doors") or {}
+        # Collect all UniFi door IDs we care about
+        all_ids: list[str] = []
+        for door_data in doors_cfg.values():
+            all_ids.extend(door_data.get("unifiDoorIds") or [])
+        all_ids = list(dict.fromkeys(all_ids))  # dedupe, preserve order
+
+        try:
+            statuses = await unifi_client.get_door_statuses(all_ids)
+        except Exception as exc:
+            return {"doors": [], "error": str(exc)}
+
+        groups = []
+        for door_key, door_data in doors_cfg.items():
+            unifi_ids = door_data.get("unifiDoorIds") or []
+            groups.append({
+                "key": door_key,
+                "label": door_data.get("label") or door_key,
+                "doors": [
+                    {
+                        "id": did,
+                        **statuses.get(did, {"status": "UNKNOWN", "name": did, "position": "UNKNOWN"}),
+                    }
+                    for did in unifi_ids
+                ],
+            })
+        return {"doors": groups, "error": None}
+
+    @app.post("/api/unifi/door/{door_id}/lock")
+    async def api_lock_door(door_id: str) -> dict:
+        from fastapi.responses import JSONResponse
+        try:
+            await unifi_client.lock_door(door_id)
+            return {"ok": True}
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"ok": False, "error": str(exc)})
+
+    @app.get("/api/door-schedule")
+    async def api_door_schedule() -> dict:
+        """Return per-door unlock windows (local day + minutes) for the current sync window."""
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta
+
+        now = datetime.now(timezone.utc)
+        end_dt = now + timedelta(hours=int(settings.sync_lookahead_hours))
+        preview = await sync_service.get_preview(start_dt=now, end_dt=end_dt)
+        door_windows = (preview.get("schedule") or {}).get("doorWindows") or []
+
+        try:
+            from py_app.mapping import load_room_door_mapping
+            mapping_cfg = load_room_door_mapping(settings.room_door_mapping_file)
+            all_door_keys = list((mapping_cfg.get("doors") or {}).keys())
+        except Exception:
+            all_door_keys = []
+
+        color_for_key = {dk: _DOOR_COLORS[i % len(_DOOR_COLORS)] for i, dk in enumerate(all_door_keys)}
+        local_tz = ZoneInfo(settings.display_timezone)
+        door_map: dict[str, dict] = {}
+
+        for w in door_windows:
+            key = w["doorKey"]
+            if key not in door_map:
+                door_map[key] = {
+                    "key": key,
+                    "label": w["doorLabel"],
+                    "color": color_for_key.get(key, _DOOR_COLORS[len(door_map) % len(_DOOR_COLORS)]),
+                    "windows": [],
+                }
+            start_utc = datetime.fromisoformat(w["openStart"].replace("Z", "+00:00"))
+            end_utc   = datetime.fromisoformat(w["openEnd"].replace("Z", "+00:00"))
+            cur = start_utc.astimezone(local_tz)
+            end_local = end_utc.astimezone(local_tz)
+            while cur < end_local:
+                next_mid = (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                seg_end = min(end_local, next_mid)
+                start_min = cur.hour * 60 + cur.minute
+                end_min   = seg_end.hour * 60 + seg_end.minute
+                if end_min == 0:
+                    end_min = 1440
+                if end_min > start_min:
+                    door_map[key]["windows"].append({
+                        "day": cur.weekday(),  # 0=Mon … 6=Sun
+                        "startMin": start_min,
+                        "endMin": end_min,
+                    })
+                cur = next_mid
+
+        # Return in mapping order so colors and display order stay consistent
+        ordered = [door_map[dk] for dk in all_door_keys if dk in door_map]
+        ordered += [v for dk, v in door_map.items() if dk not in all_door_keys]
+        return {"timezone": settings.display_timezone, "doors": ordered}
 
     @app.get("/api/pco/calendars")
     async def api_pco_calendars() -> dict:
@@ -440,13 +539,11 @@ def create_app() -> FastAPI:
             if not event_id:
                 continue
             door_key = str(it.get("doorKey") or "").strip()
-            door_label = str(it.get("doorLabel") or door_key).strip()
             if not door_key:
                 continue
-            entry = f"{door_label} ({door_key})"
             existing = event_doors.setdefault(event_id, [])
-            if entry not in existing:
-                existing.append(entry)
+            if door_key not in existing:
+                existing.append(door_key)
 
         mapping = None
         try:
@@ -454,6 +551,11 @@ def create_app() -> FastAPI:
             mapping = load_room_door_mapping(settings.room_door_mapping_file)
         except Exception:
             mapping = None
+
+        door_color_map: dict[str, str] = {}
+        if isinstance(mapping, dict):
+            for i, dk in enumerate(list((mapping.get("doors") or {}).keys())):
+                door_color_map[dk] = _DOOR_COLORS[i % len(_DOOR_COLORS)]
 
         mapping_rows = []
         if isinstance(mapping, dict):
@@ -500,8 +602,13 @@ def create_app() -> FastAPI:
         events_rows_list = []
         for e in preview_events:
             eid = str(e.get("id") or "")
-            doors_str = ", ".join(event_doors.get(eid, []))
-            doors_html = _esc(doors_str) if doors_str else '<span style="color:#9ca3af">(none mapped)</span>'
+            _doors_cfg = (mapping.get("doors") or {}) if isinstance(mapping, dict) else {}
+            _door_spans = []
+            for _dk in event_doors.get(eid, []):
+                _color = door_color_map.get(_dk, "#6b7280")
+                _lbl = str((_doors_cfg.get(_dk) or {}).get("label") or _dk)
+                _door_spans.append(f'<span style="color:{_color};font-weight:600">{_esc(_lbl)}</span>')
+            doors_html = ", ".join(_door_spans) or '<span style="color:#9ca3af">(none mapped)</span>'
             rooms_str = ", ".join(e["rooms"]) if e.get("rooms") else str(e.get("room") or "")
             ename = str(e.get("name") or "")
             estart = str(e.get("startAt") or "")
@@ -625,6 +732,18 @@ def create_app() -> FastAPI:
       .status-actions form button {{ width: 100%; }}
       .event-count {{ display: block; margin: 4px 0 0; }}
     }}
+    .sched-grid {{ width: 100%; }}
+    .sched-lbl {{ width: 28px; flex-shrink: 0; font-size: 10px; color: #94a3b8; padding-right: 4px;
+      display: flex; align-items: center; justify-content: flex-end; }}
+    .sched-track {{ position: relative; flex: 1; border-left: 1px solid #e2e8f0; }}
+    .sched-hr {{ position: absolute; font-size: 9px; color: #94a3b8; transform: translateX(-50%); top: 1px; user-select: none; }}
+    .sched-vline {{ position: absolute; top: 0; bottom: 0; border-left: 1px solid #f3f4f6; }}
+    .sched-vline-major {{ border-color: #e2e8f0; }}
+    .sched-modal-overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 9999;
+      display: none; align-items: center; justify-content: center; }}
+    .sched-modal-overlay.open {{ display: flex; }}
+    .sched-modal {{ background: white; border-radius: 12px; padding: 20px; max-width: 860px;
+      width: 95%; max-height: 90vh; overflow: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }}
   </style>
 </head>
 <body>
@@ -652,6 +771,18 @@ def create_app() -> FastAPI:
     </div>
 
     {pending_card_html}
+
+    <!-- Door Status -->
+    <div class="card" id="doorStatusCard">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px;">
+        <span class="card-title" style="margin:0">Door Status</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span id="dsTime" style="font-size:11px;color:#94a3b8"></span>
+          <button class="sm" onclick="refreshDoorStatus()" title="Refresh" style="padding:3px 7px;font-size:16px;line-height:1;">↻</button>
+        </div>
+      </div>
+      <div id="dsBody" style="color:#64748b;font-size:14px;">Loading…</div>
+    </div>
 
     <!-- Upcoming Events (always visible) -->
     <div class="card">
@@ -816,6 +947,208 @@ def create_app() -> FastAPI:
         btn.disabled = false;
       }}
     }}
+
+    // ── Door Status ──────────────────────────────────────────────────────────
+    const DS_REFRESH_MS = {settings.door_status_refresh_seconds * 1000};
+    let _lastSchedData = null;
+
+    async function refreshDoorStatus() {{
+      try {{
+        const [sR, schR] = await Promise.all([
+          fetch('/api/unifi/door-status'),
+          fetch('/api/door-schedule')
+        ]);
+        const sd = await sR.json(), sch = await schR.json();
+        _lastSchedData = {{status: sd, sched: sch}};
+        renderDoorStatus(sd, sch);
+      }} catch (e) {{
+        document.getElementById('dsBody').innerHTML =
+          '<span style="color:#ef4444">Error: ' + e.message + '</span>';
+      }}
+    }}
+
+    // Build a reusable schedule grid (compact or expanded)
+    function buildSchedGrid(doors, opts) {{
+      const laneH = opts.laneH, labelH = opts.labelH, hourStep = opts.hourStep,
+            showLabels = opts.showLabels, altBg = opts.altBg;
+      const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+      const n = doors.length;
+      const rowH = n * laneH + 4;
+      let html = '<div class="sched-grid">';
+
+      // Header row
+      html += '<div style="display:flex;height:' + labelH + 'px">'
+        + '<div class="sched-lbl"></div><div class="sched-track">';
+      for (let h = 0; h <= 24; h += hourStep) {{
+        html += '<span class="sched-hr" style="left:' + (h/24*100).toFixed(2) + '%">'
+          + String(h%24).padStart(2,'0') + '</span>';
+      }}
+      html += '</div></div>';
+
+      // Day rows
+      for (let day = 0; day < 7; day++) {{
+        const bg = (altBg && day%2===0) ? '#f8fafc' : 'transparent';
+        html += '<div style="display:flex;height:' + rowH + 'px;background:' + bg + '">'
+          + '<div class="sched-lbl" style="height:' + rowH + 'px">' + DAYS[day] + '</div>'
+          + '<div class="sched-track">';
+        // Grid lines
+        for (let h = 0; h <= 24; h++) {{
+          html += '<div class="sched-vline' + (h%hourStep===0?' sched-vline-major':'')
+            + '" style="left:' + (h/24*100).toFixed(3) + '%"></div>';
+        }}
+        // Per-door stacked bars
+        for (let di = 0; di < n; di++) {{
+          const door = doors[di];
+          for (const win of (door.windows||[])) {{
+            if (win.day !== day) continue;
+            const l  = (win.startMin/1440*100).toFixed(3);
+            const w  = ((win.endMin-win.startMin)/1440*100).toFixed(3);
+            const t  = 2 + di*laneH;
+            const bh = laneH - 2;
+            const sH = String(Math.floor(win.startMin/60)).padStart(2,'0');
+            const sM = String(win.startMin%60).padStart(2,'0');
+            const eH = String(Math.floor(win.endMin/60)%24).padStart(2,'0');
+            const eM = String(win.endMin%60).padStart(2,'0');
+            const tStr = sH+':'+sM+'–'+eH+':'+eM;
+            html += '<div style="position:absolute;left:' + l + '%;width:' + w
+              + '%;top:' + t + 'px;height:' + bh
+              + 'px;border-radius:2px;background:' + door.color
+              + ';opacity:0.85;overflow:hidden;min-width:3px" title="' + door.label + ' ' + tStr + '">';
+            if (showLabels) {{
+              html += '<span style="position:absolute;left:4px;top:50%;transform:translateY(-50%);'
+                + 'font-size:10px;color:white;white-space:nowrap;font-weight:600">' + tStr + '</span>';
+            }}
+            html += '</div>';
+          }}
+        }}
+        html += '</div></div>';
+      }}
+      html += '</div>';
+      return html;
+    }}
+
+    // Build live-status lookup maps from statusData
+    function buildLiveMaps(statusData) {{
+      const liveByKey = {{}}, idByKey = {{}}, positionByKey = {{}};
+      for (const g of (statusData.doors||[])) {{
+        let unlocked=false, unknown=true, pos='UNKNOWN';
+        for (const d of (g.doors||[])) {{
+          if (d.status==='UNLOCKED') {{ unlocked=true; unknown=false; }}
+          else if (d.status==='LOCKED') {{ unknown=false; }}
+          if (!idByKey[g.key]) idByKey[g.key]=d.id;
+          if (pos==='UNKNOWN' && d.position && d.position!=='UNKNOWN') pos=d.position;
+        }}
+        liveByKey[g.key]     = unknown?'UNKNOWN':(unlocked?'UNLOCKED':'LOCKED');
+        positionByKey[g.key] = pos;
+      }}
+      return {{liveByKey, idByKey, positionByKey}};
+    }}
+
+    // Build the legend HTML (used in both card and modal)
+    function buildLegend(doors, liveByKey, idByKey, positionByKey, closeModalOnLock) {{
+      let html = '';
+      for (const d of doors) {{
+        const live = liveByKey[d.key]||'UNKNOWN';
+        const isUnlocked=live==='UNLOCKED', isUnknown=live==='UNKNOWN';
+        const doorId=idByKey[d.key];
+        const pos=positionByKey[d.key]||'UNKNOWN';
+
+        // Lock/unlock badge
+        const lockBg  = isUnknown?'#f1f5f9':(isUnlocked?'#dcfce7':'#fee2e2');
+        const lockClr = isUnknown?'#64748b':(isUnlocked?'#15803d':'#dc2626');
+        const lockTxt = isUnknown?'?':(isUnlocked?'Unlocked':'Locked');
+        const lockCb = closeModalOnLock?'lockDoor(this);closeSchedModal()':'lockDoor(this)';
+        const lockAttrs = (isUnlocked&&doorId)
+          ? ' data-door-id="'+doorId+'" data-label="'+d.label+'" onclick="'+lockCb+'" style="cursor:pointer" title="Click to lock"'
+          : '';
+
+        // Door position badge (physical sensor)
+        const posBadge = (pos==='UNKNOWN') ? ''
+          : '<span style="font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;background:'
+            +(pos==='OPEN'?'#fef3c7':'#f1f5f9')+';color:'
+            +(pos==='OPEN'?'#92400e':'#475569')+'">'
+            +(pos==='OPEN'?'Door Open':'Door Closed')+'</span>';
+
+        html += '<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">'
+          + '<span style="width:10px;height:10px;border-radius:2px;background:'+d.color+';flex-shrink:0"></span>'
+          + '<span style="font-size:12px;font-weight:600;color:#1e293b">'+d.label+'</span>'
+          + '<span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;background:'+lockBg+';color:'+lockClr+'"'+lockAttrs+'>'+lockTxt+'</span>'
+          + posBadge
+          + '</div>';
+      }}
+      return html;
+    }}
+
+    function renderDoorStatus(statusData, schedData) {{
+      const body   = document.getElementById('dsBody');
+      const timeEl = document.getElementById('dsTime');
+      const doors  = schedData.doors||[];
+      const {{liveByKey, idByKey, positionByKey}} = buildLiveMaps(statusData);
+
+      const legend = '<div style="display:flex;flex-direction:column;gap:5px;margin-bottom:10px">'
+        + buildLegend(doors, liveByKey, idByKey, positionByKey, false) + '</div>';
+
+      const grid = '<div onclick="openSchedModal()" style="cursor:pointer" title="Click for detail">'
+        + buildSchedGrid(doors, {{laneH:5, labelH:12, hourStep:4, showLabels:false, altBg:true}})
+        + '</div>';
+
+      body.innerHTML = !doors.length
+        ? '<span style="color:#9ca3af">No scheduled windows in the current sync window.</span>'
+        : legend + grid;
+      timeEl.textContent = new Date().toLocaleTimeString();
+    }}
+
+    function openSchedModal() {{
+      if (!_lastSchedData) return;
+      const {{status: sd, sched: sch}} = _lastSchedData;
+      const doors = sch.doors||[];
+      const {{liveByKey, idByKey, positionByKey}} = buildLiveMaps(sd);
+
+      let overlay = document.getElementById('schedModalOverlay');
+      if (!overlay) {{
+        overlay = document.createElement('div');
+        overlay.id = 'schedModalOverlay';
+        overlay.className = 'sched-modal-overlay';
+        overlay.addEventListener('click', function(e) {{ if (e.target===overlay) closeSchedModal(); }});
+        document.body.appendChild(overlay);
+      }}
+
+      const legend = '<div style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px">'
+        + buildLegend(doors, liveByKey, idByKey, positionByKey, true) + '</div>';
+
+      overlay.innerHTML = '<div class="sched-modal">'
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
+        + '<strong style="font-size:15px;color:#1e293b">Door Schedule — Next 7 Days</strong>'
+        + '<button onclick="closeSchedModal()" style="background:none;border:none;font-size:20px;cursor:pointer;color:#94a3b8;line-height:1">✕</button>'
+        + '</div>'
+        + legend
+        + '<div style="font-size:11px;color:#94a3b8;margin-bottom:10px">Times in ' + sch.timezone + '</div>'
+        + buildSchedGrid(doors, {{laneH:22, labelH:18, hourStep:2, showLabels:true, altBg:true}})
+        + '</div>';
+      overlay.className = 'sched-modal-overlay open';
+    }}
+
+    function closeSchedModal() {{
+      const overlay = document.getElementById('schedModalOverlay');
+      if (overlay) overlay.className = 'sched-modal-overlay';
+    }}
+
+    async function lockDoor(el) {{
+      const doorId = el.dataset.doorId;
+      const label  = el.dataset.label;
+      if (!confirm('Lock "' + label + '" now?\\n\\nThis will override any active unlock schedule.')) return;
+      try {{
+        const resp = await fetch('/api/unifi/door/' + doorId + '/lock', {{method: 'POST'}});
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+        await refreshDoorStatus();
+      }} catch (e) {{
+        alert('Lock failed: ' + e.message);
+      }}
+    }}
+
+    refreshDoorStatus();
+    if (DS_REFRESH_MS > 0) {{ setInterval(refreshDoorStatus, DS_REFRESH_MS); }}
 
     async function restoreEvent(btn) {{
       const id = btn.dataset.id;
@@ -1644,6 +1977,7 @@ def create_app() -> FastAPI:
             "syncCron": settings.sync_cron or "",
             "lookaheadHours": int(settings.sync_lookahead_hours),
             "timezone": settings.display_timezone,
+            "doorStatusRefreshSeconds": int(settings.door_status_refresh_seconds),
             "telegramConfigured": bool(settings.telegram_bot_token and settings.telegram_chat_ids),
         }
 
@@ -1721,12 +2055,17 @@ def create_app() -> FastAPI:
             lookahead = int(payload.get("lookaheadHours") or 168)
         except (ValueError, TypeError):
             return JSONResponse(status_code=422, content={"ok": False, "error": "Lookahead must be an integer"})
+        try:
+            door_refresh = max(10, int(payload.get("doorStatusRefreshSeconds") or 30))
+        except (ValueError, TypeError):
+            return JSONResponse(status_code=422, content={"ok": False, "error": "Door status refresh must be an integer"})
 
         updates: dict[str, str] = {}
         if cron:
             updates["SYNC_CRON"] = cron
         if lookahead:
             updates["SYNC_LOOKAHEAD_HOURS"] = str(lookahead)
+        updates["DOOR_STATUS_REFRESH_SECONDS"] = str(door_refresh)
         tz = str(payload.get("timezone") or "").strip()
         if tz:
             updates["DISPLAY_TIMEZONE"] = tz
@@ -1920,6 +2259,16 @@ def create_app() -> FastAPI:
           Maximum recommended: 720 (30 days).
         </p>
         <div class="field-row">
+          <label>Door status refresh interval</label>
+          <input type="number" name="doorStatusRefreshSeconds" value="{settings.door_status_refresh_seconds}" min="10" max="3600" />
+          <span class="field-hint">seconds</span>
+        </div>
+        <p class="field-note">
+          How often the Dashboard polls UniFi for live door lock status. 30 seconds is a good default.
+          Set higher (e.g. 120) to reduce network traffic, or lower (minimum 10) for near-real-time updates.
+          Set to 0 to disable automatic polling (you can still refresh manually).
+        </p>
+        <div class="field-row">
           <label>Display timezone</label>
           <input type="text" name="timezone" value="{_esc(settings.display_timezone)}" style="width:220px" />
           <span class="field-hint">IANA timezone name</span>
@@ -2024,11 +2373,12 @@ def create_app() -> FastAPI:
       const note = document.getElementById("sysNote");
       btn.disabled = true;
       const payload = {{
-        syncCron:          form.syncCron.value.trim(),
-        lookaheadHours:    parseInt(form.lookaheadHours.value) || 168,
-        timezone:          form.timezone.value.trim(),
-        telegramBotToken:  form.telegramBotToken.value,
-        telegramChatIds:   form.telegramChatIds.value.trim(),
+        syncCron:                   form.syncCron.value.trim(),
+        lookaheadHours:             parseInt(form.lookaheadHours.value) || 168,
+        timezone:                   form.timezone.value.trim(),
+        doorStatusRefreshSeconds:   parseInt(form.doorStatusRefreshSeconds.value) || 30,
+        telegramBotToken:           form.telegramBotToken.value,
+        telegramChatIds:            form.telegramChatIds.value.trim(),
       }};
       try {{
         const resp = await fetch("/api/system-settings", {{
