@@ -139,6 +139,7 @@ def build_office_hours_windows(
                     "openStart": start_utc.isoformat().replace("+00:00", "Z"),
                     "openEnd": end_utc.isoformat().replace("+00:00", "Z"),
                     "sourceEventIds": ["office-hours"],
+                    "sourceEventNames": ["Office Hours"],
                     "sourceRooms": ["Office Hours"],
                 })
 

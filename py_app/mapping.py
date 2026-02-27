@@ -68,6 +68,7 @@ def _merge_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "openStart": _to_iso(start),
                 "openEnd": _to_iso(end),
                 "sourceEventIds": list(w.get("sourceEventIds") or []),
+                "sourceEventNames": list(w.get("sourceEventNames") or []),
                 "sourceRooms": list(w.get("sourceRooms") or []),
             })
             continue
@@ -82,6 +83,7 @@ def _merge_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if end > last_end:
                 last["openEnd"] = _to_iso(end)
             last["sourceEventIds"] = list(dict.fromkeys((last.get("sourceEventIds") or []) + (w.get("sourceEventIds") or [])))
+            last["sourceEventNames"] = list(dict.fromkeys((last.get("sourceEventNames") or []) + (w.get("sourceEventNames") or [])))
             last["sourceRooms"] = list(dict.fromkeys((last.get("sourceRooms") or []) + (w.get("sourceRooms") or [])))
         else:
             merged.append({
@@ -91,6 +93,7 @@ def _merge_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "openStart": _to_iso(start),
                 "openEnd": _to_iso(end),
                 "sourceEventIds": list(w.get("sourceEventIds") or []),
+                "sourceEventNames": list(w.get("sourceEventNames") or []),
                 "sourceRooms": list(w.get("sourceRooms") or []),
             })
 
@@ -193,6 +196,7 @@ def build_desired_schedule(
                                 "openStart": _to_iso(open_start),
                                 "openEnd": _to_iso(open_end),
                                 "sourceEventIds": [str(evt.get("id", ""))],
+                                "sourceEventNames": [str(evt.get("name", ""))],
                                 "sourceRooms": [room_name],
                             }
                         )

@@ -26,36 +26,6 @@
     }
   },
   "rooms": {
-    "Front Lobby": [
-      "front_lobby"
-    ],
-    "Rear Lobby": [
-      "rear_lobby"
-    ],
-    "Lobby": [
-      "front_lobby",
-      "rear_lobby"
-    ],
-    "Sanctuary": [
-      "front_lobby",
-      "rear_lobby"
-    ],
-    "Overflow Room - Left": [
-      "front_lobby",
-      "rear_lobby"
-    ],
-    "Overflow Room - Right": [
-      "front_lobby",
-      "rear_lobby"
-    ],
-    "115 - Classroom": [
-      "front_lobby",
-      "rear_lobby"
-    ],
-    "116 - Classroom": [
-      "front_lobby",
-      "rear_lobby"
-    ],
     "103 Classroom": [
       "gym_front"
     ],
@@ -70,6 +40,17 @@
     ],
     "113-114 Classroom": [
       "gym_front"
+    ],
+    "115 - Classroom": [
+      "front_lobby",
+      "rear_lobby"
+    ],
+    "116 - Classroom": [
+      "front_lobby",
+      "rear_lobby"
+    ],
+    "119 Office": [
+      "office"
     ],
     "201 - Mt. Laurel Room": [
       "gym_front"
@@ -88,14 +69,23 @@
       "front_lobby",
       "rear_lobby"
     ],
+    "Front Lobby": [
+      "front_lobby"
+    ],
+    "Gym": [
+      "gym_front"
+    ],
+    "Gymnasium": [
+      "gym_front"
+    ],
     "Kitchen": [
       "gym_front"
     ],
-    "Nursery": [
+    "Lobby": [
       "front_lobby",
       "rear_lobby"
     ],
-    "119 Office": [
+    "Nursery": [
       "front_lobby",
       "rear_lobby"
     ],
@@ -103,11 +93,20 @@
       "front_lobby",
       "rear_lobby"
     ],
-    "Gym": [
-      "gym_front"
+    "Overflow Room - Left": [
+      "front_lobby",
+      "rear_lobby"
     ],
-    "Gymnasium": [
-      "gym_front"
+    "Overflow Room - Right": [
+      "front_lobby",
+      "rear_lobby"
+    ],
+    "Rear Lobby": [
+      "rear_lobby"
+    ],
+    "Sanctuary": [
+      "front_lobby",
+      "rear_lobby"
     ]
   },
   "defaults": {

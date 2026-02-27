@@ -348,6 +348,7 @@ def create_app() -> FastAPI:
                         "day": cur.weekday(),  # 0=Mon … 6=Sun
                         "startMin": start_min,
                         "endMin": end_min,
+                        "events": list(dict.fromkeys(w.get("sourceEventNames") or [])),
                     })
                 cur = next_mid
 
@@ -1010,13 +1011,19 @@ def create_app() -> FastAPI:
             const eH = String(Math.floor(win.endMin/60)%24).padStart(2,'0');
             const eM = String(win.endMin%60).padStart(2,'0');
             const tStr = sH+':'+sM+'–'+eH+':'+eM;
+            const evts = (win.events||[]).map(function(s){{ return s.trim(); }}).filter(Boolean);
+            const evtNames = evts.join(', ');
+            let tip = door.label + ' — ' + tStr;
+            if (evts.length === 1) tip += ' — ' + evts[0];
+            else if (evts.length > 1) tip += '&#10;Events: ' + evts.join('&#10;  • ');
             html += '<div style="position:absolute;left:' + l + '%;width:' + w
               + '%;top:' + t + 'px;height:' + bh
               + 'px;border-radius:2px;background:' + door.color
-              + ';opacity:0.85;overflow:hidden;min-width:3px" title="' + door.label + ' ' + tStr + '">';
+              + ';opacity:0.85;overflow:hidden;min-width:3px" title="' + tip.replace(/"/g,'&quot;') + '">';
             if (showLabels) {{
+              const barLabel = evtNames ? tStr + '  ' + evtNames : tStr;
               html += '<span style="position:absolute;left:4px;top:50%;transform:translateY(-50%);'
-                + 'font-size:10px;color:white;white-space:nowrap;font-weight:600">' + tStr + '</span>';
+                + 'font-size:10px;color:white;white-space:nowrap;font-weight:600">' + barLabel + '</span>';
             }}
             html += '</div>';
           }}

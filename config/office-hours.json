@@ -15,7 +15,7 @@
     "wednesday": {
       "ranges": "9:00-11:00",
       "doors": [
-        "rear_lobby",
+        "front_lobby",
         "office"
       ]
     },
@@ -32,8 +32,12 @@
       "doors": []
     },
     "sunday": {
-      "ranges": "",
-      "doors": []
+      "ranges": "6:00-12:30",
+      "doors": [
+        "front_lobby",
+        "rear_lobby",
+        "office"
+      ]
     }
   }
 }
