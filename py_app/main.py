@@ -13,7 +13,7 @@ _esc = html.escape  # shorthand used throughout HTML generation
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from py_app.event_overrides import (
     add_cancelled_event,
@@ -191,6 +191,96 @@ a:hover { text-decoration: underline; }
 _DOOR_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899"]
 
 
+def _make_icon_png(size: int) -> bytes:
+    """Generate a door icon PNG: navy background, slate frame, glass panel, blue knob."""
+    import struct, zlib
+
+    W = H = size
+    buf = bytearray([15, 23, 42] * (W * H))  # navy #0f172a background
+
+    def fill_rect(fx1: float, fy1: float, fx2: float, fy2: float, col: tuple) -> None:
+        x1, y1 = int(fx1 * W), int(fy1 * H)
+        x2, y2 = int(fx2 * W), int(fy2 * H)
+        cr, cg, cb = col
+        row_bytes = bytes([cr, cg, cb] * max(0, x2 - x1))
+        for y in range(max(0, y1), min(H, y2)):
+            base = y * W * 3 + x1 * 3
+            buf[base : base + len(row_bytes)] = row_bytes
+
+    def fill_circle(fcx: float, fcy: float, fr: float, col: tuple) -> None:
+        cx, cy, rad = int(fcx * W), int(fcy * H), max(1, int(fr * W))
+        cr, cg, cb = col
+        rad2 = rad * rad
+        for y in range(max(0, cy - rad - 1), min(H, cy + rad + 2)):
+            for x in range(max(0, cx - rad - 1), min(W, cx + rad + 2)):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= rad2:
+                    i = (y * W + x) * 3
+                    buf[i] = cr; buf[i + 1] = cg; buf[i + 2] = cb
+
+    # Proportions based on a 64-unit grid (same as the SVG)
+    # Door frame (slate-400 #94a3b8)
+    fill_rect(17/64, 12/64, 47/64, 53/64, (148, 163, 184))
+    # Door surface (slate-50 #f8fafc)
+    fill_rect(20/64, 15/64, 44/64, 50/64, (248, 250, 252))
+    # Upper glass panel (blue-200 #bfdbfe)
+    fill_rect(23/64, 18/64, 41/64, 28/64, (191, 219, 254))
+    # Horizontal divider (slate-300 #cbd5e1)
+    fill_rect(20/64, 31/64, 44/64, 33/64, (203, 213, 225))
+    # Lower panel (slate-200 #e2e8f0)
+    fill_rect(23/64, 34/64, 41/64, 46/64, (226, 232, 240))
+    # Doorknob (blue-500 #3b82f6)
+    fill_circle(40/64, 36/64, 2.8/64, (59, 130, 246))
+
+    raw = b"".join(b"\x00" + bytes(buf[y * W * 3 : (y + 1) * W * 3]) for y in range(H))
+    compressed = zlib.compress(raw, 6)
+
+    def chunk(t: bytes, d: bytes) -> bytes:
+        c = zlib.crc32(t + d) & 0xFFFFFFFF
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", c)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", compressed)
+        + chunk(b"IEND", b"")
+    )
+
+
+# SVG icon — used as browser-tab favicon (vector, scales perfectly at any size)
+_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" fill="#0f172a"/>'
+    # Door frame slate-400
+    '<rect x="17" y="12" width="30" height="41" rx="2" fill="#94a3b8"/>'
+    # Door surface slate-50
+    '<rect x="20" y="15" width="24" height="35" rx="1" fill="#f8fafc"/>'
+    # Upper glass panel blue-200
+    '<rect x="23" y="18" width="18" height="10" rx="1" fill="#bfdbfe"/>'
+    # Divider slate-300
+    '<rect x="20" y="31" width="24" height="2" fill="#cbd5e1"/>'
+    # Lower panel slate-200
+    '<rect x="23" y="34" width="18" height="12" rx="1" fill="#e2e8f0"/>'
+    # Doorknob blue-500
+    '<circle cx="40" cy="36" r="2.5" fill="#3b82f6"/>'
+    '</svg>'
+)
+
+_ICON_192 = _make_icon_png(192)
+_ICON_512 = _make_icon_png(512)
+
+_PWA_HEAD = (
+    '  <link rel="manifest" href="/manifest.json">\n'
+    '  <link rel="icon" type="image/svg+xml" href="/icon.svg">\n'
+    '  <meta name="theme-color" content="#0f172a">\n'
+    '  <meta name="mobile-web-app-capable" content="yes">\n'
+    '  <meta name="apple-mobile-web-app-capable" content="yes">\n'
+    '  <meta name="apple-mobile-web-app-title" content="PCO Sync">\n'
+    '  <link rel="apple-touch-icon" href="/icon-192.png">\n'
+    "  <script>if('serviceWorker'in navigator){"
+    "navigator.serviceWorker.register('/sw.js');}</script>\n"
+)
+
+
 def create_app() -> FastAPI:
     settings = Settings()
     logger = get_logger()
@@ -246,6 +336,44 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> dict:
         return {"ok": True}
+
+    @app.get("/manifest.json")
+    async def pwa_manifest() -> Response:
+        return Response(
+            content=json.dumps({
+                "name": "PCO \u2192 UniFi Sync",
+                "short_name": "PCO Sync",
+                "start_url": "/dashboard",
+                "display": "standalone",
+                "background_color": "#0f172a",
+                "theme_color": "#0f172a",
+                "icons": [
+                    {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"},
+                    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+                ],
+            }),
+            media_type="application/manifest+json",
+        )
+
+    @app.get("/sw.js")
+    async def pwa_service_worker() -> Response:
+        return Response(
+            content="self.addEventListener('fetch',function(e){});\n",
+            media_type="application/javascript",
+        )
+
+    @app.get("/icon.svg")
+    async def pwa_icon_svg() -> Response:
+        return Response(content=_ICON_SVG, media_type="image/svg+xml")
+
+    @app.get("/icon-192.png")
+    async def pwa_icon_192() -> Response:
+        return Response(content=_ICON_192, media_type="image/png")
+
+    @app.get("/icon-512.png")
+    async def pwa_icon_512() -> Response:
+        return Response(content=_ICON_512, media_type="image/png")
 
     @app.get("/api/status")
     async def api_status() -> dict:
@@ -717,7 +845,7 @@ def create_app() -> FastAPI:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Dashboard — PCO UniFi Sync</title>
-  <style>{_SHARED_CSS}
+{_PWA_HEAD}  <style>{_SHARED_CSS}
     .status-bar {{ display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
     .status-items {{ display: flex; align-items: center; gap: 16px; flex-wrap: wrap; flex: 1; min-width: 0; }}
     .status-item {{ display: flex; align-items: center; font-size: 14px; color: #374151; white-space: nowrap; }}
@@ -1264,7 +1392,7 @@ def create_app() -> FastAPI:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Room Mapping — PCO UniFi Sync</title>
-  <style>{_SHARED_CSS}
+{_PWA_HEAD}  <style>{_SHARED_CSS}
     .room-name {{ font-weight: 500; white-space: nowrap; }}
   </style>
 </head>
@@ -1436,7 +1564,7 @@ def create_app() -> FastAPI:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Office Hours — PCO UniFi Sync</title>
-  <style>{_SHARED_CSS}
+{_PWA_HEAD}  <style>{_SHARED_CSS}
     .day-name {{ font-weight: 600; white-space: nowrap; width: 100px; }}
     .ranges-input {{ padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; width: 100%; }}
     .ranges-input:focus {{ outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px #bfdbfe; }}
@@ -1635,7 +1763,7 @@ def create_app() -> FastAPI:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Event Overrides — PCO UniFi Sync</title>
-  <style>{_SHARED_CSS}
+{_PWA_HEAD}  <style>{_SHARED_CSS}
     .event-row.hidden {{ display: none; }}
     .btn-edit {{ background: #eff6ff; color: #2563eb; border-color: #bfdbfe; font-size: 13px; padding: 4px 10px; border-radius: 6px; }}
     .btn-edit:hover {{ background: #dbeafe; }}
@@ -2121,7 +2249,7 @@ def create_app() -> FastAPI:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Settings — PCO UniFi Sync</title>
-  <style>{_SHARED_CSS}
+{_PWA_HEAD}  <style>{_SHARED_CSS}
     .field-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }}
     .field-row label {{ font-size: 14px; color: #374151; min-width: 220px; }}
     .field-row input {{ width: 220px; }}
