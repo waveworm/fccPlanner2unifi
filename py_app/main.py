@@ -36,9 +36,11 @@ from py_app.vendors.pco import PcoClient
 # Shared CSS for all pages — plain Python string (no f-string) so CSS {} braces don't need escaping.
 _SHARED_CSS = """
 * { box-sizing: border-box; }
+html { overflow-x: hidden; }
 body {
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
   margin: 0; background: #f8fafc; color: #1e293b; min-height: 100vh;
+  overflow-x: hidden; max-width: 100%;
 }
 .page { max-width: 1600px; margin: 0 auto; padding: 24px; }
 
@@ -171,12 +173,14 @@ a:hover { text-decoration: underline; }
   .site-nav { width: 100%; flex-wrap: wrap; padding-bottom: 6px; gap: 2px; }
   .site-nav a { font-size: 12px; padding: 4px 8px; }
   /* Cards */
-  .card { padding: 14px 12px; }
+  .card { padding: 14px 12px; overflow: hidden; }
   .details-body { padding: 14px 12px; }
   details.collapsible > summary { padding: 12px 14px; }
   /* Tables */
   th, td { padding: 6px 7px; font-size: 13px; }
   th { font-size: 11px; }
+  /* Constrain table wrappers so they scroll inside the card, not the page */
+  div[style*="overflow"] { max-width: 100%; }
   /* Hide low-priority columns on small screens */
   .hide-mob { display: none !important; }
   /* Toast — anchor to bottom so it doesn't overlap content */
@@ -614,6 +618,16 @@ def create_app() -> FastAPI:
                 f'<span class="show-mob">{_fmt_local_short(iso_str)}</span>'
             )
 
+        def _fmt_hhmm(hhmm: str) -> str:
+            """Convert '18:40' (24h) → '6:40 PM' for display."""
+            try:
+                h, m = hhmm.split(":")
+                h, m = int(h), int(m)
+                ampm = "AM" if h < 12 else "PM"
+                return f"{h % 12 or 12}:{m:02d} {ampm}"
+            except Exception:
+                return hhmm
+
         status = sync_service.snapshot()
         last_sync_at_raw = status.get("lastSyncAt")
         last_sync_at = _fmt_local(last_sync_at_raw) if last_sync_at_raw else "(never)"
@@ -653,6 +667,18 @@ def create_app() -> FastAPI:
         cancelled_ids = {str(i.get("id")) for i in cancelled_instances if i.get("id")}
 
         try:
+            _ov_data = load_event_overrides(settings.event_overrides_file)
+            dash_overrides: dict = _ov_data.get("overrides") or {}
+        except Exception:
+            dash_overrides = {}
+
+        try:
+            _mem_data = load_event_memory(settings.event_memory_file)
+            dash_mem_events: list = _mem_data.get("events") or []
+        except Exception:
+            dash_mem_events = []
+
+        try:
             preview = await sync_service.get_upcoming_preview(limit=50)
         except Exception as exc:
             logger.error("Dashboard preview failed", extra={"err": str(exc)})
@@ -682,9 +708,13 @@ def create_app() -> FastAPI:
             mapping = None
 
         door_color_map: dict[str, str] = {}
+        door_keys: list[str] = []
+        doors_map: dict = {}
         if isinstance(mapping, dict):
             for i, dk in enumerate(list((mapping.get("doors") or {}).keys())):
                 door_color_map[dk] = _DOOR_COLORS[i % len(_DOOR_COLORS)]
+            door_keys = list((mapping.get("doors") or {}).keys())
+            doors_map = mapping.get("doors") or {}
 
         mapping_rows = []
         if isinstance(mapping, dict):
@@ -742,20 +772,74 @@ def create_app() -> FastAPI:
             ename = str(e.get("name") or "")
             estart = str(e.get("startAt") or "")
             eend = str(e.get("endAt") or "")
+            ename_lower = ename.lower()
+            ov_key = next((k for k in dash_overrides if k.lower() == ename_lower), None)
+            has_override = ov_key is not None
+            override_badge = (
+                ' <span style="font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;'
+                'background:#dbeafe;color:#1d4ed8;vertical-align:middle">Override</span>'
+                if has_override else ""
+            )
+
+            # Build per-door override time detail shown below the event name
+            override_detail_html = ""
+            if has_override:
+                door_ovs = (dash_overrides[ov_key].get("doorOverrides") or {}) if ov_key else {}
+                ov_lines = []
+                for _dk, _ov in door_ovs.items():
+                    _color = door_color_map.get(_dk, "#6b7280")
+                    _lbl = _esc(str((doors_map.get(_dk) or {}).get("label") or _dk))
+                    _wins = _ov.get("windows") or []
+                    if not _wins:
+                        # suppressed
+                        ov_lines.append(
+                            f'<span style="color:{_color}">&#9679;</span> '
+                            f'<span style="color:#64748b">{_lbl}:</span> '
+                            f'<span style="color:#94a3b8;font-style:italic">blocked</span>'
+                        )
+                    else:
+                        _time_parts = []
+                        for _w in _wins:
+                            _o = _fmt_hhmm(_w.get("openTime") or "")
+                            _c = _fmt_hhmm(_w.get("closeTime") or "")
+                            _time_parts.append(
+                                f'<span style="color:#059669">{_esc(_o)}</span>'
+                                f'<span style="color:#64748b"> – </span>'
+                                f'<span style="color:#dc2626">{_esc(_c)}</span>'
+                            )
+                        ov_lines.append(
+                            f'<span style="color:{_color}">&#9679;</span> '
+                            f'<span style="color:#64748b">{_lbl}:</span> '
+                            + ' <span style="color:#cbd5e1">/</span> '.join(_time_parts)
+                        )
+                if ov_lines:
+                    override_detail_html = (
+                        '<div style="margin-top:5px;font-size:11px;line-height:1.9;'
+                        'border-top:1px solid #e2e8f0;padding-top:5px">'
+                        + "<br>".join(ov_lines)
+                        + "</div>"
+                    )
+
+            override_btn_label = "Edit Override" if has_override else "Set Override"
             cancel_btn = (
                 f'<button class="sm danger" '
                 f'data-id="{_esc(eid)}" data-name="{_esc(ename)}" '
                 f'data-start="{_esc(estart)}" data-end="{_esc(eend)}" '
                 f'onclick="cancelEvent(this)">Cancel</button>'
             )
+            override_btn = (
+                f'<button class="sm" style="margin-top:4px" '
+                f'data-name="{_esc(ename)}" data-start="{_esc(estart)}" data-end="{_esc(eend)}" '
+                f'onclick="openOverrideModal(this)">&#9881; {_esc(override_btn_label)}</button>'
+            )
             events_rows_list.append(
                 "<tr>"
                 f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
                 f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
-                f"<td><strong>{_esc(ename)}</strong></td>"
+                f"<td><strong>{_esc(ename)}</strong>{override_badge}{override_detail_html}</td>"
                 f'<td class="hide-mob">{_esc(rooms_str)}</td>'
                 f'<td class="hide-mob">{doors_html}</td>'
-                f"<td>{cancel_btn}</td>"
+                f'<td style="white-space:nowrap">{cancel_btn}<br/>{override_btn}</td>'
                 "</tr>"
             )
         events_rows = "\n".join(events_rows_list)
@@ -843,7 +927,7 @@ def create_app() -> FastAPI:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Dashboard — PCO UniFi Sync</title>
 {_PWA_HEAD}  <style>{_SHARED_CSS}
     .status-bar {{ display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
@@ -873,9 +957,79 @@ def create_app() -> FastAPI:
     .sched-modal-overlay.open {{ display: flex; }}
     .sched-modal {{ background: white; border-radius: 12px; padding: 20px; max-width: 860px;
       width: 95%; max-height: 90vh; overflow: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }}
+    .ov-modal-overlay {{ position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 9998;
+      display: none; align-items: flex-start; justify-content: center; padding: 40px 12px; overflow-y: auto; }}
+    .ov-modal-overlay.open {{ display: flex; }}
+    .ov-modal {{ background: white; border-radius: 12px; padding: 24px; max-width: 800px;
+      width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,0.3); position: relative; }}
+    .ov-modal h3 {{ margin: 0 0 4px; font-size: 17px; color: #1e293b; }}
+    .ov-modal .ov-ref {{ font-size: 12px; color: #64748b; margin: 0 0 14px; line-height: 1.6; }}
+    .ov-instructions {{ font-size: 12px; color: #475569; background: #f8fafc;
+      border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; line-height: 1.6; }}
+    .ov-edit-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    .ov-edit-table th {{ padding: 7px 8px; border-bottom: 2px solid #bfdbfe; font-size: 11px;
+      color: #3b82f6; text-align: left; white-space: nowrap; }}
+    .ov-edit-table td {{ padding: 7px 8px; border-bottom: 1px solid #dbeafe; vertical-align: middle; }}
+    .ov-edit-table tbody tr:hover td {{ background: #f0f9ff; }}
+    .ov-time-input {{ width: 72px; padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 5px;
+      font-size: 13px; font-family: monospace; }}
+    .ov-time-input:disabled {{ background: #f9fafb; color: #9ca3af; }}
+    .ov-actions {{ display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }}
+    #sched-tip {{
+      position: fixed; z-index: 10001; pointer-events: none; display: none;
+      background: #1e293b; color: #f1f5f9; border-radius: 8px; padding: 10px 14px;
+      font-size: 13px; line-height: 1.5; box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      max-width: 280px; word-break: break-word;
+    }}
+    .stip-door {{ font-size: 10px; color: #94a3b8; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .06em; margin-bottom: 2px; }}
+    .stip-time {{ font-size: 18px; font-weight: 700; color: #fff; margin-bottom: 8px; }}
+    .stip-ev-header {{ font-size: 10px; color: #64748b; text-transform: uppercase;
+      letter-spacing: .05em; margin-bottom: 4px; border-top: 1px solid rgba(255,255,255,.1);
+      padding-top: 7px; }}
+    .stip-ev {{ font-size: 12px; color: #cbd5e1; padding: 1px 0 1px 10px; position: relative; }}
+    .stip-ev::before {{ content: '•'; position: absolute; left: 0; color: #60a5fa; }}
   </style>
 </head>
 <body>
+  <div id="sched-tip"></div>
+
+  <!-- Override Editor Modal -->
+  <div id="ovModalOverlay" class="ov-modal-overlay" onclick="if(event.target===this)closeOverrideModal()">
+    <div class="ov-modal">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+        <div>
+          <h3 id="ovModalTitle">Event Override</h3>
+          <div id="ovModalRef" class="ov-ref"></div>
+        </div>
+        <button onclick="closeOverrideModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:#94a3b8;line-height:1;padding:0 0 0 12px">✕</button>
+      </div>
+      <div class="ov-instructions">
+        <strong>Checked + times filled</strong> → door opens at those exact times for this event only.&nbsp;
+        <strong>Checked + times blank</strong> → door is <em>suppressed</em> (won't open for this event).&nbsp;
+        <strong>Unchecked</strong> → door uses the global lead/lag default.
+      </div>
+      <div style="overflow:auto">
+        <table class="ov-edit-table">
+          <thead>
+            <tr>
+              <th>Door</th><th>Default Schedule</th><th style="text-align:center">Override?</th>
+              <th>Window 1 Open</th><th>Window 1 Close</th>
+              <th>Window 2 Open <span style="font-weight:normal;color:#93c5fd;font-size:10px">(opt)</span></th>
+              <th>Window 2 Close <span style="font-weight:normal;color:#93c5fd;font-size:10px">(opt)</span></th>
+            </tr>
+          </thead>
+          <tbody id="ovDoorRows"></tbody>
+        </table>
+      </div>
+      <div class="ov-actions">
+        <button class="primary" onclick="saveOverrideModal()">Save Override</button>
+        <button class="danger" onclick="removeOverrideModal()">Remove Override</button>
+        <button onclick="closeOverrideModal()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   {_nav("dashboard")}
   <div class="page">
     <div id="dash-toast" class="toast"></div>
@@ -1000,6 +1154,14 @@ def create_app() -> FastAPI:
 
   </div>
   <script>
+    // Data for override editor modal
+    const OV_OVERRIDES  = {json.dumps(dash_overrides)};
+    const OV_MEM_EVENTS = {json.dumps(dash_mem_events)};
+    const OV_DOOR_KEYS  = {json.dumps(door_keys)};
+    const OV_DOORS_MAP  = {json.dumps(doors_map)};
+    const OV_MAPPING    = {json.dumps(mapping if isinstance(mapping, dict) else {{}})};
+    const OV_TZ         = {json.dumps(settings.display_timezone)};
+
     const _toast = () => document.getElementById('dash-toast');
     function _showToast(msg, ok) {{
       const t = _toast();
@@ -1141,13 +1303,16 @@ def create_app() -> FastAPI:
             const tStr = sH+':'+sM+'–'+eH+':'+eM;
             const evts = (win.events||[]).map(function(s){{ return s.trim(); }}).filter(Boolean);
             const evtNames = evts.join(', ');
-            let tip = door.label + ' — ' + tStr;
-            if (evts.length === 1) tip += ' — ' + evts[0];
-            else if (evts.length > 1) tip += '&#10;Events: ' + evts.join('&#10;  • ');
-            html += '<div style="position:absolute;left:' + l + '%;width:' + w
+            const _tid = 'b' + (++window._schedBarId);
+            window._schedTips[_tid] = {{door: door.label, time: tStr, evts: evts, color: door.color}};
+            html += '<div data-tip-id="' + _tid + '"'
+              + ' onmouseenter="showSchedTip(this,event)"'
+              + ' onmousemove="moveSchedTip(event)"'
+              + ' onmouseleave="hideSchedTip()"'
+              + ' style="position:absolute;left:' + l + '%;width:' + w
               + '%;top:' + t + 'px;height:' + bh
               + 'px;border-radius:2px;background:' + door.color
-              + ';opacity:0.85;overflow:hidden;min-width:3px" title="' + tip.replace(/"/g,'&quot;') + '">';
+              + ';opacity:0.85;overflow:hidden;min-width:3px;cursor:default">';
             if (showLabels) {{
               const barLabel = evtNames ? tStr + '  ' + evtNames : tStr;
               html += '<span style="position:absolute;left:4px;top:50%;transform:translateY(-50%);'
@@ -1282,6 +1447,223 @@ def create_app() -> FastAPI:
       }}
     }}
 
+    // ── Override Editor Modal ────────────────────────────────────────────────
+    let _ovCurrentName = null;
+
+    function _ovFmtTime(iso) {{
+      if (!iso) return '';
+      try {{
+        return new Intl.DateTimeFormat('en-US', {{
+          timeZone: OV_TZ, hour: 'numeric', minute: '2-digit', hour12: true,
+        }}).format(new Date(iso));
+      }} catch(e) {{ return iso; }}
+    }}
+
+    function _ovFmtDate(iso) {{
+      if (!iso) return '';
+      try {{
+        return new Intl.DateTimeFormat('en-US', {{
+          timeZone: OV_TZ, weekday: 'short', month: 'short', day: 'numeric',
+        }}).format(new Date(iso));
+      }} catch(e) {{ return iso; }}
+    }}
+
+    function openOverrideModal(btn) {{
+      const eventName = btn.dataset.name;
+      const evtStart  = btn.dataset.start || null;
+      const evtEnd    = btn.dataset.end   || null;
+      _ovCurrentName  = eventName;
+
+      document.getElementById('ovModalTitle').textContent = eventName;
+
+      const memEvt = OV_MEM_EVENTS.find(e => (e.name||'').toLowerCase() === eventName.toLowerCase()) || {{}};
+      const eventRooms = memEvt.rooms || [];
+      const roomsMap   = (OV_MAPPING && OV_MAPPING.rooms) || {{}};
+      const applicableDoors = new Set();
+      for (const room of eventRooms) {{
+        for (const dk of (roomsMap[room] || [])) applicableDoors.add(dk);
+      }}
+
+      const refStart = evtStart || memEvt.nextAt || memEvt.lastSeenAt || null;
+      const refEnd   = evtEnd   || memEvt.nextEndAt || memEvt.lastEndAt || null;
+      const defaults = (OV_MAPPING && OV_MAPPING.defaults) || {{}};
+      const leadMins = defaults.unlockLeadMinutes || 15;
+      const lagMins  = defaults.unlockLagMinutes  || 15;
+      let normOpen = null, normClose = null;
+      if (refStart) normOpen  = new Date(new Date(refStart).getTime() - leadMins * 60000).toISOString();
+      if (refEnd)   normClose = new Date(new Date(refEnd).getTime()   + lagMins  * 60000).toISOString();
+
+      const refEl = document.getElementById('ovModalRef');
+      if (refStart) {{
+        let info = `<strong>${{_ovFmtDate(refStart)}}</strong>`;
+        info += ` &nbsp;·&nbsp; <strong>Event:</strong> ${{_ovFmtTime(refStart)}}`;
+        if (refEnd) info += ` – ${{_ovFmtTime(refEnd)}}`;
+        if (normOpen && normClose) info += ` &nbsp;·&nbsp; <strong>Default doors:</strong> ${{_ovFmtTime(normOpen)}} – ${{_ovFmtTime(normClose)}} <span style="color:#9ca3af">(${{leadMins}} min before / ${{lagMins}} min after)</span>`;
+        refEl.innerHTML = info;
+      }} else {{
+        refEl.textContent = '';
+      }}
+
+      const nameLower = eventName.toLowerCase();
+      const ovKey = Object.keys(OV_OVERRIDES).find(k => k.toLowerCase() === nameLower);
+      const doorOverrides = ovKey ? ((OV_OVERRIDES[ovKey] || {{}}).doorOverrides || {{}}) : {{}};
+
+      function buildDoorRow(dk, isApplicable) {{
+        let defCell = '';
+        if (isApplicable && normOpen && normClose) {{
+          defCell = `<span style="color:#059669;font-size:12px">Opens</span> <strong>${{_ovFmtTime(normOpen)}}</strong><br><span style="color:#dc2626;font-size:12px">Closes</span> <strong>${{_ovFmtTime(normClose)}}</strong>`;
+        }} else if (!isApplicable) {{
+          defCell = `<span style="color:#d1d5db;font-size:12px">Not in this event</span>`;
+        }} else {{
+          defCell = `<span style="color:#9ca3af;font-size:12px">Times unknown</span>`;
+        }}
+        const doorCfg = doorOverrides.hasOwnProperty(dk) ? doorOverrides[dk] : null;
+        const wins = doorCfg ? (doorCfg.windows || []) : [];
+        const w1 = wins[0] || {{}}, w2 = wins[1] || {{}};
+        const label = (OV_DOORS_MAP[dk] && OV_DOORS_MAP[dk].label) ? OV_DOORS_MAP[dk].label : dk;
+        const chk = doorCfg !== null ? 'checked' : '';
+        const dis = doorCfg !== null ? '' : 'disabled';
+        const rowStyle = isApplicable ? '' : 'opacity:0.4';
+        return `<tr style="${{rowStyle}}">
+          <td><strong>${{label}}</strong><br><span style="font-size:11px;color:#6b7280">${{dk}}</span></td>
+          <td>${{defCell}}</td>
+          <td style="text-align:center"><input type="checkbox" id="ovChk_${{dk}}" ${{chk}} onchange="ovToggleDoor('${{dk}}')" style="width:18px;height:18px;cursor:pointer;accent-color:#2563eb"></td>
+          <td><input type="text" id="ovO1_${{dk}}" value="${{w1.openTime||''}}" placeholder="HH:MM" class="ov-time-input" ${{dis}}></td>
+          <td><input type="text" id="ovC1_${{dk}}" value="${{w1.closeTime||''}}" placeholder="HH:MM" class="ov-time-input" ${{dis}}></td>
+          <td><input type="text" id="ovO2_${{dk}}" value="${{w2.openTime||''}}" placeholder="HH:MM" class="ov-time-input" ${{dis}}></td>
+          <td><input type="text" id="ovC2_${{dk}}" value="${{w2.closeTime||''}}" placeholder="HH:MM" class="ov-time-input" ${{dis}}></td>
+        </tr>`;
+      }}
+
+      const appKeys   = OV_DOOR_KEYS.filter(dk => applicableDoors.has(dk));
+      const otherKeys = OV_DOOR_KEYS.filter(dk => !applicableDoors.has(dk));
+      let rows = appKeys.map(dk => buildDoorRow(dk, true)).join('');
+      if (otherKeys.length) {{
+        rows += `<tr><td colspan="7" style="padding:5px 8px;font-size:11px;color:#9ca3af;background:#f9fafb;border-top:2px solid #e5e7eb;text-transform:uppercase;letter-spacing:.05em">Other doors — not in this event's rooms</td></tr>`;
+        rows += otherKeys.map(dk => buildDoorRow(dk, false)).join('');
+      }}
+      document.getElementById('ovDoorRows').innerHTML = rows;
+      document.getElementById('ovModalOverlay').className = 'ov-modal-overlay open';
+    }}
+
+    function closeOverrideModal() {{
+      _ovCurrentName = null;
+      document.getElementById('ovModalOverlay').className = 'ov-modal-overlay';
+    }}
+
+    function ovToggleDoor(dk) {{
+      const chk = document.getElementById('ovChk_' + dk);
+      ['ovO1_','ovC1_','ovO2_','ovC2_'].forEach(p => {{
+        const el = document.getElementById(p + dk);
+        if (el) el.disabled = !chk.checked;
+      }});
+      if (chk.checked) {{
+        const first = document.getElementById('ovO1_' + dk);
+        if (first && !first.value) first.focus();
+      }}
+    }}
+
+    async function saveOverrideModal() {{
+      if (!_ovCurrentName) return;
+      const timeRe = /^\d{{1,2}}:\d{{2}}$/;
+      const doorOverrides = {{}};
+      for (const dk of OV_DOOR_KEYS) {{
+        const chk = document.getElementById('ovChk_' + dk);
+        if (!chk || !chk.checked) continue;
+        const o1 = (document.getElementById('ovO1_' + dk).value || '').trim();
+        const c1 = (document.getElementById('ovC1_' + dk).value || '').trim();
+        const o2 = (document.getElementById('ovO2_' + dk).value || '').trim();
+        const c2 = (document.getElementById('ovC2_' + dk).value || '').trim();
+        const label = (OV_DOORS_MAP[dk] && OV_DOORS_MAP[dk].label) ? OV_DOORS_MAP[dk].label : dk;
+        if (!o1 && !c1 && !o2 && !c2) {{ doorOverrides[dk] = {{ windows: [] }}; continue; }}
+        if (!timeRe.test(o1) || !timeRe.test(c1)) {{
+          _showToast('Invalid Window 1 time for ' + label + '. Use HH:MM (24h) or leave blank to suppress.', false);
+          return;
+        }}
+        const windows = [{{ openTime: o1, closeTime: c1 }}];
+        if (o2 || c2) {{
+          if (!timeRe.test(o2) || !timeRe.test(c2)) {{
+            _showToast('Invalid Window 2 time for ' + label + '. Use HH:MM or leave both blank.', false);
+            return;
+          }}
+          windows.push({{ openTime: o2, closeTime: c2 }});
+        }}
+        doorOverrides[dk] = {{ windows }};
+      }}
+      if (!Object.keys(doorOverrides).length) {{
+        _showToast('Check at least one door, or use Remove Override to clear.', false);
+        return;
+      }}
+      const newOverrides = Object.assign({{}}, OV_OVERRIDES);
+      const existingKey  = Object.keys(newOverrides).find(k => k.toLowerCase() === _ovCurrentName.toLowerCase());
+      newOverrides[existingKey || _ovCurrentName] = {{ doorOverrides }};
+      await _ovPost(newOverrides, 'Override saved.');
+    }}
+
+    async function removeOverrideModal() {{
+      if (!_ovCurrentName) return;
+      const newOverrides = Object.assign({{}}, OV_OVERRIDES);
+      const existingKey  = Object.keys(newOverrides).find(k => k.toLowerCase() === _ovCurrentName.toLowerCase());
+      if (existingKey) delete newOverrides[existingKey];
+      await _ovPost(newOverrides, 'Override removed.');
+    }}
+
+    async function _ovPost(overrides, msg) {{
+      try {{
+        const resp = await fetch('/api/event-overrides', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ overrides }}),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || 'Save failed');
+        closeOverrideModal();
+        _showToast(msg, true);
+        setTimeout(() => location.reload(), 1500);
+      }} catch(err) {{
+        _showToast('Error: ' + err.message, false);
+      }}
+    }}
+
+    // ── Custom schedule bar tooltip ──────────────────────────────────────────
+    window._schedTips = {{}};
+    window._schedBarId = 0;
+
+    function showSchedTip(el, e) {{
+      const data = window._schedTips[el.dataset.tipId];
+      if (!data) return;
+      const tip = document.getElementById('sched-tip');
+      const dot = '<span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
+        + 'background:' + data.color + ';margin-right:5px;vertical-align:middle"></span>';
+      let h = '<div class="stip-door">' + dot + _tipEsc(data.door) + '</div>'
+            + '<div class="stip-time">' + _tipEsc(data.time) + '</div>';
+      if (data.evts && data.evts.length) {{
+        h += '<div class="stip-ev-header">'
+          + (data.evts.length === 1 ? 'Event' : data.evts.length + ' Events') + '</div>';
+        for (const ev of data.evts) h += '<div class="stip-ev">' + _tipEsc(ev) + '</div>';
+      }}
+      tip.innerHTML = h;
+      tip.style.display = 'block';
+      _posSchedTip(e.clientX, e.clientY);
+    }}
+    function moveSchedTip(e) {{
+      if (document.getElementById('sched-tip').style.display !== 'none')
+        _posSchedTip(e.clientX, e.clientY);
+    }}
+    function hideSchedTip() {{ document.getElementById('sched-tip').style.display = 'none'; }}
+    function _posSchedTip(x, y) {{
+      const tip = document.getElementById('sched-tip');
+      const tw = tip.offsetWidth, th = tip.offsetHeight;
+      let lx = x + 16, ly = y + 16;
+      if (lx + tw > window.innerWidth  - 8) lx = x - tw - 12;
+      if (ly + th > window.innerHeight - 8) ly = y - th - 12;
+      tip.style.left = lx + 'px';
+      tip.style.top  = ly + 'px';
+    }}
+    function _tipEsc(s) {{
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }}
+
     refreshDoorStatus();
     if (DS_REFRESH_MS > 0) {{ setInterval(refreshDoorStatus, DS_REFRESH_MS); }}
 
@@ -1390,7 +1772,7 @@ def create_app() -> FastAPI:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Room Mapping — PCO UniFi Sync</title>
 {_PWA_HEAD}  <style>{_SHARED_CSS}
     .room-name {{ font-weight: 500; white-space: nowrap; }}
@@ -1562,7 +1944,7 @@ def create_app() -> FastAPI:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Office Hours — PCO UniFi Sync</title>
 {_PWA_HEAD}  <style>{_SHARED_CSS}
     .day-name {{ font-weight: 600; white-space: nowrap; width: 100px; }}
@@ -1761,7 +2143,7 @@ def create_app() -> FastAPI:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Event Overrides — PCO UniFi Sync</title>
 {_PWA_HEAD}  <style>{_SHARED_CSS}
     .event-row.hidden {{ display: none; }}
@@ -2247,7 +2629,7 @@ def create_app() -> FastAPI:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Settings — PCO UniFi Sync</title>
 {_PWA_HEAD}  <style>{_SHARED_CSS}
     .field-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }}

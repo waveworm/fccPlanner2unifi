@@ -596,6 +596,109 @@ Set `DISPLAY_TIMEZONE` in `.env`. Restart required.
 
 ---
 
+## Recommended UX Roadmap
+
+These are the highest-value product improvements for making the system easier and safer for new operators.
+
+### 1) Quick Door Access (manual temporary unlock window)
+
+This is the most useful next feature for day-to-day operations.
+
+Add a dashboard workflow that lets a staff member:
+- choose one or more doors from a dropdown
+- choose **start now** or a custom start time
+- choose an end time (required)
+- optionally enter a short reason/note
+- save the temporary window without editing PCO or office hours
+
+Recommended implementation shape:
+- Store these entries in a new file such as `config/manual-access-windows.json`
+- Merge them into the desired schedule the same way office hours are merged
+- Auto-prune expired entries
+- Show active manual windows in a dedicated dashboard card with a clear **Cancel now** action
+- Record `createdAt`, `createdBy` (if auth is added later), and `reason` for auditability
+
+Important constraint:
+- Require an explicit end time. Do not support open-ended unlocks.
+
+### 2) First-run onboarding
+
+New users currently need to understand several separate pages before the system feels safe to use.
+
+Add a simple onboarding checklist on the dashboard:
+- UniFi reachable
+- PCO reachable
+- mapping configured
+- required UniFi schedules found
+- apply mode status
+- next sync time
+
+This should be visible before the user starts editing anything.
+
+### 3) Safer manual controls
+
+If the app is used outside a locked-down private network, add protection before expanding manual control features.
+
+Recommended minimums:
+- restrict the web UI to Tailscale, LAN allowlist, or reverse-proxy auth
+- add a visible banner when the app is exposed without access control
+- keep destructive actions behind confirm dialogs
+
+### 4) Better defaults for non-technical operators
+
+To reduce mistakes, add opinionated shortcuts:
+- preset manual durations like 15, 30, 60, and 120 minutes
+- quick actions like **Open front doors for 30 min**
+- human-readable summaries before save: `Front Lobby + Rear Lobby, today 6:00 PM to 7:30 PM`
+
+### 5) Scheduling clarity
+
+Operators should be able to tell *why* a door is opening.
+
+Improve the dashboard schedule display to show:
+- source type (`PCO`, `Office Hours`, `Manual`)
+- the reason/event name that created each window
+- the exact local start/end for the currently active window
+
+### 6) Audit logging for operator actions
+
+This is strongly recommended if the UI will be used over Tailscale by multiple people.
+
+Every manual action should create an audit record, especially:
+- switching between dry-run and apply mode
+- approving or denying after-hours events
+- cancelling or restoring events
+- saving office hours, mapping changes, overrides, or general settings
+- creating, editing, or cancelling future manual access windows
+- sending a direct door command
+
+Recommended audit record fields:
+- `timestamp`
+- `action`
+- `target` (event name, door key, settings section, etc.)
+- `requestIp`
+- `tailscaleIp` (same as request IP when directly connected)
+- `displayName`
+- `hostname`
+- `note`
+- `result` (`ok` or `error`)
+
+Recommended implementation shape:
+- Add a new append-only file such as `config/audit-log.jsonl`
+- Write one JSON object per line for easy grep/export
+- Capture the client IP from FastAPI request context (`request.client.host`)
+- If running behind a trusted reverse proxy later, only then honor forwarded headers
+
+For Tailscale-friendly names:
+- Easiest path: maintain a small local mapping file like `config/tailscale-peers.json` from IP -> person/device label
+- Better path: resolve the IP against the local Tailscale status/API and cache the peer name
+- Always log the raw IP even if name resolution fails
+
+Important constraint:
+- Never rely only on machine name for identity. Use it as a convenience label, not as the source of truth.
+
+---
+
 ## Key Design Decisions & Constraints
 
 1. **No database.** All state is in memory (sync status, errors) or flat JSON files (mapping, office hours, sync state, approvals). This keeps deployment simple.
