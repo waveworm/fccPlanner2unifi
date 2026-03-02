@@ -316,22 +316,35 @@ class UnifiAccessClient:
 
     async def apply_desired_schedule(self, desired: dict[str, Any]) -> None:
         door_windows = desired.get("doorWindows") or []
-        if not isinstance(door_windows, list) or not door_windows:
+        if not isinstance(door_windows, list):
             return
 
         by_door: dict[str, list[dict[str, Any]]] = {}
         door_ids_by_door: dict[str, set[str]] = {}
+        desired_doors_cfg = desired.get("doorConfigs") or {}
+        all_door_keys: set[str] = set()
         for w in door_windows:
             dk = str(w.get("doorKey") or "").strip()
             if not dk:
                 continue
+            all_door_keys.add(dk)
             by_door.setdefault(dk, []).append(w)
             for raw_id in (w.get("unifiDoorIds") or []):
                 rid = str(raw_id).strip()
                 if rid:
                     door_ids_by_door.setdefault(dk, set()).add(rid)
+        if isinstance(desired_doors_cfg, dict):
+            for dk, cfg in desired_doors_cfg.items():
+                door_key = str(dk).strip()
+                if not door_key:
+                    continue
+                all_door_keys.add(door_key)
+                for raw_id in ((cfg or {}).get("unifiDoorIds") or []):
+                    rid = str(raw_id).strip()
+                    if rid:
+                        door_ids_by_door.setdefault(door_key, set()).add(rid)
 
-        if not by_door:
+        if not all_door_keys:
             return
 
         async with httpx.AsyncClient(
@@ -344,7 +357,7 @@ class UnifiAccessClient:
             schedules_by_name = {str(r.get("name") or ""): r for r in existing_schedules}
             policies_by_name = {str(r.get("name") or ""): r for r in existing_policies}
 
-            for door_key in sorted(by_door.keys()):
+            for door_key in sorted(all_door_keys):
                 # Use pre-created schedules from UniFi UI and never auto-create schedules here.
                 schedule_name_candidates = [
                     f"PCO Sync {door_key}",
@@ -366,9 +379,6 @@ class UnifiAccessClient:
                     )
 
                 door_ids = sorted(door_ids_by_door.get(door_key) or [])
-                if not door_ids:
-                    continue
-
                 desired_weekly = self._build_week_schedule(by_door.get(door_key) or [])
                 detail_payload = await self._api_get(
                     client,
@@ -392,6 +402,9 @@ class UnifiAccessClient:
                         f"/api/v1/developer/access_policies/schedules/{schedule_id}",
                         schedule_payload,
                     )
+
+                if not door_ids:
+                    continue
 
                 policy_name = f"PCO Sync Policy {door_key}"
                 desired_resource = [{"id": rid, "type": "door"} for rid in door_ids]

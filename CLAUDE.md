@@ -17,6 +17,8 @@ When an event is scheduled in PCO (e.g., "Celebrate Recovery" in the Cafe), the 
 
 It also supports **Office Hours** — a static recurring weekly schedule that unlocks specific doors during configured times regardless of whether any event is scheduled.
 
+It also supports **Quick Door Access** — manually created temporary unlock windows for a selected door group, configured from the dashboard without changing PCO events or office hours.
+
 It also supports **Event Time Overrides** — per-event-name rules that replace the global lead/lag with exact clock times per door, optionally across two separate unlock windows per door. A door can also be suppressed (blocked) for a specific event while still opening normally for other events.
 
 It also supports an **Approval Gate** — events that start outside configured "safe hours" are held in a pending queue and require manual approval before their door schedule is applied. Events by pre-approved names bypass the gate automatically.
@@ -64,6 +66,7 @@ fccplanner2unifi/
 │   ├── safe-hours.json            # Per-day safe hours windows for approval gate (managed via /general-settings)
 │   ├── pending-approvals.json     # Queue of events awaiting approval (auto-managed, never edit)
 │   ├── cancelled-events.json      # Events manually cancelled from the dashboard (auto-managed)
+│   ├── manual-access-windows.json # Temporary manual unlock windows (managed from dashboard)
 │   └── sync-state.json            # Persisted apply/dry-run toggle state (auto-created, do not commit)
 ├── deploy/
 │   └── pco-unifi-sync.service     # systemd unit file
@@ -696,6 +699,18 @@ For Tailscale-friendly names:
 
 Important constraint:
 - Never rely only on machine name for identity. Use it as a convenience label, not as the source of truth.
+
+Current implementation:
+- Audit logging is now wired into the existing POST routes in `py_app/main.py`
+- Logs are written to `config/audit-log.jsonl`
+- Friendly labels are resolved from `config/tailscale-peers.json`, with reverse-DNS hostname lookup as a fallback
+- The dashboard now shows a recent changes panel for quick review
+
+Quick Door Access implementation:
+- Temporary manual unlock windows are stored in `config/manual-access-windows.json`
+- They are created and canceled from the dashboard
+- They are merged into the normal door schedule during preview and sync
+- Create/cancel actions are included in the audit log
 
 ---
 

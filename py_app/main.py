@@ -15,6 +15,7 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import Body, FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from py_app.audit import append_audit_log, ensure_tailscale_peer_map, read_recent_audit_entries
 from py_app.event_overrides import (
     add_cancelled_event,
     load_cancelled_events,
@@ -23,6 +24,12 @@ from py_app.event_overrides import (
     remove_cancelled_event,
     save_event_overrides,
     validate_event_overrides,
+)
+from py_app.manual_access import (
+    cancel_manual_access_entry,
+    create_manual_access_entry,
+    list_manual_access,
+    validate_manual_access_window,
 )
 from py_app.approvals import load_safe_hours, save_safe_hours
 from py_app.logger import get_logger
@@ -293,8 +300,35 @@ def create_app() -> FastAPI:
     sync_service = SyncService(settings, logger)
     unifi_client = UnifiAccessClient(settings)
     pco_client = PcoClient(settings)
+    config_dir = Path(settings.room_door_mapping_file).resolve().parent
+    audit_log_file = str(config_dir / "audit-log.jsonl")
+    tailscale_peers_file = str(config_dir / "tailscale-peers.json")
+    manual_access_file = str(config_dir / "manual-access-windows.json")
+    ensure_tailscale_peer_map(tailscale_peers_file)
 
     scheduler = AsyncIOScheduler(timezone="UTC")
+
+    def _audit(
+        request: Request,
+        *,
+        action: str,
+        target: str = "",
+        note: str = "",
+        result: str = "ok",
+        error: str = "",
+        extra: dict | None = None,
+    ) -> None:
+        append_audit_log(
+            audit_log_file,
+            tailscale_peers_file,
+            request=request,
+            action=action,
+            target=target,
+            note=note,
+            result=result,
+            error=error,
+            extra=extra,
+        )
 
     def _nav(active: str) -> str:
         """Generate the shared site header HTML."""
@@ -425,12 +459,14 @@ def create_app() -> FastAPI:
         return {"doors": groups, "error": None}
 
     @app.post("/api/unifi/door/{door_id}/lock")
-    async def api_lock_door(door_id: str) -> dict:
+    async def api_lock_door(door_id: str, request: Request) -> dict:
         from fastapi.responses import JSONResponse
         try:
             await unifi_client.lock_door(door_id)
+            _audit(request, action="door.lock", target=door_id)
             return {"ok": True}
         except Exception as exc:
+            _audit(request, action="door.lock", target=door_id, result="error", error=str(exc))
             return JSONResponse(status_code=502, content={"ok": False, "error": str(exc)})
 
     @app.get("/api/door-schedule")
@@ -523,22 +559,35 @@ def create_app() -> FastAPI:
             "unifiBaseUrl": str(settings.unifi_access_base_url),
         }
 
+    @app.get("/api/audit/recent")
+    async def api_audit_recent(limit: int = 20) -> dict:
+        limit = max(1, min(int(limit), 200))
+        return {"entries": read_recent_audit_entries(audit_log_file, limit=limit)}
+
     @app.post("/api/config/apply")
-    async def api_config_apply(payload: dict = Body(...)) -> dict:
+    async def api_config_apply(request: Request, payload: dict = Body(...)) -> dict:
         value = bool(payload.get("applyToUnifi"))
         sync_service.set_apply_to_unifi(value)
+        _audit(request, action="mode.set", target="applyToUnifi", note=f"apply={str(value).lower()}")
         return {"ok": True, "applyToUnifi": sync_service.get_apply_to_unifi()}
 
     @app.post("/dashboard/apply")
     async def dashboard_apply(request: Request) -> RedirectResponse:
         raw = (await request.body()).decode("utf-8", "ignore")
         apply = (parse_qs(raw).get("apply") or ["false"])[0]
-        sync_service.set_apply_to_unifi(str(apply).lower() in ("1", "true", "yes", "on"))
+        next_value = str(apply).lower() in ("1", "true", "yes", "on")
+        sync_service.set_apply_to_unifi(next_value)
+        _audit(request, action="mode.set", target="applyToUnifi", note=f"apply={str(next_value).lower()}")
         return RedirectResponse(url="/dashboard", status_code=303)
 
     @app.post("/api/sync/run")
-    async def api_sync_run() -> dict:
-        await sync_service.run_once()
+    async def api_sync_run(request: Request) -> dict:
+        try:
+            await sync_service.run_once()
+        except Exception as exc:
+            _audit(request, action="sync.run", result="error", error=str(exc))
+            raise
+        _audit(request, action="sync.run")
         return {"ok": True}
 
     @app.get("/api/approvals/pending")
@@ -546,21 +595,25 @@ def create_app() -> FastAPI:
         return {"pending": sync_service.get_pending_approvals()}
 
     @app.post("/api/approvals/approve")
-    async def api_approvals_approve(payload: dict = Body(...)) -> dict:
+    async def api_approvals_approve(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         event_id = str(payload.get("id") or "").strip()
         if not event_id:
+            _audit(request, action="approval.approve", result="error", error="id required")
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
         name = sync_service.approve_event(event_id)
+        _audit(request, action="approval.approve", target=event_id, note=name or "")
         return {"ok": True, "name": name}
 
     @app.post("/api/approvals/deny")
-    async def api_approvals_deny(payload: dict = Body(...)) -> dict:
+    async def api_approvals_deny(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         event_id = str(payload.get("id") or "").strip()
         if not event_id:
+            _audit(request, action="approval.deny", result="error", error="id required")
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
         name = sync_service.deny_event(event_id)
+        _audit(request, action="approval.deny", target=event_id, note=name or "")
         return {"ok": True, "name": name}
 
     @app.get("/api/events/cancelled")
@@ -568,25 +621,110 @@ def create_app() -> FastAPI:
         return load_cancelled_events(settings.cancelled_events_file)
 
     @app.post("/api/events/cancel")
-    async def api_events_cancel(payload: dict = Body(...)) -> dict:
+    async def api_events_cancel(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         event_id = str(payload.get("id") or "").strip()
         name = str(payload.get("name") or "").strip()
         start_at = str(payload.get("startAt") or "").strip()
         end_at = str(payload.get("endAt") or "").strip()
         if not event_id:
+            _audit(request, action="event.cancel", result="error", error="id required")
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
         add_cancelled_event(settings.cancelled_events_file, event_id, name, start_at, end_at)
+        _audit(request, action="event.cancel", target=event_id, note=name)
         return {"ok": True}
 
     @app.post("/api/events/restore")
-    async def api_events_restore(payload: dict = Body(...)) -> dict:
+    async def api_events_restore(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         event_id = str(payload.get("id") or "").strip()
         if not event_id:
+            _audit(request, action="event.restore", result="error", error="id required")
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
+        restored_name = ""
+        for row in (load_cancelled_events(settings.cancelled_events_file).get("instances") or []):
+            if str(row.get("id") or "") == event_id:
+                restored_name = str(row.get("name") or "").strip()
+                break
         remove_cancelled_event(settings.cancelled_events_file, event_id)
+        _audit(request, action="event.restore", target=event_id, note=restored_name)
         return {"ok": True}
+
+    @app.get("/api/manual-access")
+    async def api_manual_access() -> dict:
+        return {"windows": list_manual_access(manual_access_file)}
+
+    @app.post("/api/manual-access")
+    async def api_manual_access_create(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+
+        door_key = str(payload.get("doorKey") or "").strip()
+        start_at = str(payload.get("startAt") or "").strip()
+        end_at = str(payload.get("endAt") or "").strip()
+        note = str(payload.get("note") or "").strip()
+        mapping = _read_mapping()
+        doors_map = mapping.get("doors") or {}
+        if not door_key or door_key not in doors_map:
+            err = "Select a valid door"
+            _audit(request, action="manual_access.create", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        err = validate_manual_access_window(start_at=start_at, end_at=end_at, door_keys=[door_key])
+        if err:
+            _audit(request, action="manual_access.create", target=door_key, result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        entry = create_manual_access_entry(
+            manual_access_file,
+            door_keys=[door_key],
+            start_at=start_at,
+            end_at=end_at,
+            note=note,
+        )
+        door_label = str((doors_map.get(door_key) or {}).get("label") or door_key)
+        _audit(
+            request,
+            action="manual_access.create",
+            target=str(entry.get("id") or ""),
+            note=f"{door_label} {start_at} -> {end_at}" + (f" ({note})" if note else ""),
+        )
+        sync_warning = ""
+        try:
+            await sync_service.run_once()
+        except Exception as exc:
+            sync_warning = str(exc)
+        return {"ok": True, "entry": entry, "syncWarning": sync_warning}
+
+    @app.post("/api/manual-access/cancel")
+    async def api_manual_access_cancel(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+
+        entry_id = str(payload.get("id") or "").strip()
+        if not entry_id:
+            err = "id required"
+            _audit(request, action="manual_access.cancel", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        removed = cancel_manual_access_entry(manual_access_file, entry_id)
+        if removed is None:
+            err = "Manual access window not found"
+            _audit(request, action="manual_access.cancel", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=404, content={"ok": False, "error": err})
+        mapping = _read_mapping()
+        doors_map = mapping.get("doors") or {}
+        door_names = [
+            str((doors_map.get(dk) or {}).get("label") or dk)
+            for dk in (removed.get("doorKeys") or [])
+        ]
+        _audit(
+            request,
+            action="manual_access.cancel",
+            target=entry_id,
+            note=", ".join([name for name in door_names if name]) or str(removed.get("note") or ""),
+        )
+        sync_warning = ""
+        try:
+            await sync_service.run_once()
+        except Exception as exc:
+            sync_warning = str(exc)
+        return {"ok": True, "syncWarning": sync_warning}
 
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard() -> HTMLResponse:
@@ -715,6 +853,37 @@ def create_app() -> FastAPI:
                 door_color_map[dk] = _DOOR_COLORS[i % len(_DOOR_COLORS)]
             door_keys = list((mapping.get("doors") or {}).keys())
             doors_map = mapping.get("doors") or {}
+
+        manual_entries = list_manual_access(manual_access_file)
+        door_options_html = "".join(
+            [
+                f'<option value="{_esc(dk, quote=True)}">{_esc(str((doors_map.get(dk) or {}).get("label") or dk))}</option>'
+                for dk in door_keys
+            ]
+        )
+        manual_rows = []
+        for entry in manual_entries:
+            entry_id = str(entry.get("id") or "")
+            entry_doors = [
+                str((doors_map.get(dk) or {}).get("label") or dk)
+                for dk in (entry.get("doorKeys") or [])
+            ]
+            note_text = str(entry.get("note") or "").strip()
+            note_html = _esc(note_text) if note_text else '<span style="color:#9ca3af">—</span>'
+            cancel_btn = (
+                f'<button class="sm danger" data-id="{_esc(entry_id)}" '
+                f'onclick="cancelManualAccess(this)">Cancel</button>'
+            )
+            manual_rows.append(
+                "<tr>"
+                f'<td>{_esc(", ".join([d for d in entry_doors if d]) or "(unknown)")}</td>'
+                f'<td style="white-space:nowrap">{_fmt_dt_cell(entry.get("startAt"))}</td>'
+                f'<td style="white-space:nowrap">{_fmt_dt_cell(entry.get("endAt"))}</td>'
+                f"<td>{note_html}</td>"
+                f"<td>{cancel_btn}</td>"
+                "</tr>"
+            )
+        manual_rows_html = "\n".join(manual_rows)
 
         mapping_rows = []
         if isinstance(mapping, dict):
@@ -852,7 +1021,7 @@ def create_app() -> FastAPI:
                 iname = _esc(str(inst.get("name") or ""))
                 istart = _fmt_local(inst.get("startAt"))
                 restore_btn = (
-                    f'<button class="sm" data-id="{_esc(iid)}" '
+                    f'<button class="sm" data-id="{_esc(iid)}" data-name="{iname}" '
                     f'onclick="restoreEvent(this)">Restore</button>'
                 )
                 cancelled_rows.append(
@@ -921,6 +1090,50 @@ def create_app() -> FastAPI:
         else:
             pending_card_html = ""
 
+        audit_rows = []
+        for entry in read_recent_audit_entries(audit_log_file, limit=12):
+            ts = _fmt_local(entry.get("timestamp"))
+            action = _esc(str(entry.get("action") or ""))
+            target = _esc(str(entry.get("target") or "")) or '<span style="color:#9ca3af">—</span>'
+            actor_name = _esc(str(entry.get("displayName") or entry.get("requestIp") or "unknown"))
+            actor_ip = _esc(str(entry.get("requestIp") or ""))
+            actor_html = actor_name
+            if actor_ip and actor_ip != actor_name:
+                actor_html += f'<div style="font-size:11px;color:#94a3b8;font-family:monospace">{actor_ip}</div>'
+            note = _esc(str(entry.get("note") or "")) or '<span style="color:#9ca3af">—</span>'
+            if entry.get("result") == "error":
+                result_html = '<span class="badge badge-err">ERROR</span>'
+                note = _esc(str(entry.get("error") or entry.get("note") or "")) or note
+            else:
+                result_html = '<span class="badge badge-apply" style="background:#dbeafe;color:#1d4ed8">OK</span>'
+            audit_rows.append(
+                "<tr>"
+                f'<td style="white-space:nowrap">{_esc(ts or "")}</td>'
+                f"<td>{action}</td>"
+                f"<td>{target}</td>"
+                f"<td>{actor_html}</td>"
+                f"<td>{note}</td>"
+                f"<td>{result_html}</td>"
+                "</tr>"
+            )
+        audit_card_html = f"""
+    <details class="collapsible">
+      <summary><span>Recent Changes</span></summary>
+      <div class="details-body">
+        <div style="overflow:auto;">
+          <table>
+            <thead><tr><th>When</th><th>Action</th><th>Target</th><th>Who</th><th>Detail</th><th>Result</th></tr></thead>
+            <tbody>
+              {"".join(audit_rows) or '<tr><td colspan="6" style="padding:12px;color:#9ca3af;">No operator changes logged yet.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <p style="margin:12px 0 0;font-size:13px;color:#64748b;">
+          Friendly names come from <code>config/tailscale-peers.json</code>. Raw IPs are always retained in the audit log.
+        </p>
+      </div>
+    </details>"""
+
         err_badge = f'<span class="badge badge-err" style="margin-left:8px">{error_count}</span>' if error_count else ""
 
         html_out = f"""<!doctype html>
@@ -934,6 +1147,9 @@ def create_app() -> FastAPI:
     .status-items {{ display: flex; align-items: center; gap: 16px; flex-wrap: wrap; flex: 1; min-width: 0; }}
     .status-item {{ display: flex; align-items: center; font-size: 14px; color: #374151; white-space: nowrap; }}
     .status-actions {{ display: flex; gap: 8px; flex-shrink: 0; }}
+    .quick-access-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; align-items:end; }}
+    .quick-access-grid label {{ font-size: 12px; color:#64748b; font-weight:600; display:block; margin-bottom:4px; }}
+    .quick-access-grid input, .quick-access-grid select {{ width:100%; }}
     .event-count {{ font-size: 12px; color: #64748b; font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }}
     .show-mob {{ display: none; }}
     @media (max-width: 640px) {{
@@ -1055,6 +1271,54 @@ def create_app() -> FastAPI:
 
     {pending_card_html}
 
+    <details class="collapsible">
+      <summary><span>Quick Door Access</span></summary>
+      <div class="details-body">
+        <p style="font-size:13px;color:#64748b;margin:0 0 12px;">
+          Create a temporary unlock window for one door group without changing PCO or office hours. The picker uses this device's local time; saved windows are displayed below in <strong>{_esc(settings.display_timezone)}</strong>.
+        </p>
+        <form id="quickAccessForm">
+          <div class="quick-access-grid">
+            <div>
+              <label for="qaDoor">Door Group</label>
+              <select id="qaDoor" required>
+                <option value="">Select a door…</option>
+                {door_options_html}
+              </select>
+            </div>
+            <div>
+              <label for="qaStartAt">Start</label>
+              <input id="qaStartAt" type="datetime-local" required />
+            </div>
+            <div>
+              <label for="qaEndAt">End</label>
+              <input id="qaEndAt" type="datetime-local" required />
+            </div>
+            <div>
+              <label for="qaNote">Note</label>
+              <input id="qaNote" type="text" maxlength="120" placeholder="Optional reason" />
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;">
+            <button type="button" class="sm" onclick="setQuickAccessNow()">Start Now</button>
+            <button type="button" class="sm" onclick="setQuickAccessDuration(15)">+15 min</button>
+            <button type="button" class="sm" onclick="setQuickAccessDuration(30)">+30 min</button>
+            <button type="button" class="sm" onclick="setQuickAccessDuration(60)">+60 min</button>
+            <button type="button" class="sm" onclick="setQuickAccessDuration(120)">+120 min</button>
+            <button type="submit" class="primary sm">Schedule Access</button>
+          </div>
+        </form>
+        <div style="overflow:auto;margin-top:14px;">
+          <table>
+            <thead><tr><th>Door</th><th>Start</th><th>End</th><th>Note</th><th>Action</th></tr></thead>
+            <tbody>
+              {manual_rows_html or '<tr><td colspan="5" style="padding:12px;color:#9ca3af;">No manual door access windows scheduled.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
     <!-- Door Status -->
     <div class="card" id="doorStatusCard">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px;">
@@ -1099,6 +1363,8 @@ def create_app() -> FastAPI:
     </div>
 
     {cancelled_card_html}
+
+    {audit_card_html}
 
     <!-- Sync Details (collapsed) -->
     <details class="collapsible">
@@ -1170,6 +1436,97 @@ def create_app() -> FastAPI:
       t.style.display = 'block';
       setTimeout(() => {{ t.style.display = 'none'; }}, ok ? 2500 : 4000);
     }}
+
+    function _toInputValue(date) {{
+      const pad = (n) => String(n).padStart(2, '0');
+      return date.getFullYear()
+        + '-' + pad(date.getMonth() + 1)
+        + '-' + pad(date.getDate())
+        + 'T' + pad(date.getHours())
+        + ':' + pad(date.getMinutes());
+    }}
+
+    function setQuickAccessNow() {{
+      document.getElementById('qaStartAt').value = _toInputValue(new Date());
+    }}
+
+    function setQuickAccessDuration(minutes) {{
+      const startEl = document.getElementById('qaStartAt');
+      const endEl = document.getElementById('qaEndAt');
+      let start = startEl.value ? new Date(startEl.value) : new Date();
+      if (Number.isNaN(start.getTime())) start = new Date();
+      endEl.value = _toInputValue(new Date(start.getTime() + minutes * 60000));
+    }}
+
+    async function submitQuickAccess(event) {{
+      event.preventDefault();
+      const doorKey = document.getElementById('qaDoor').value;
+      const startValue = document.getElementById('qaStartAt').value;
+      const endValue = document.getElementById('qaEndAt').value;
+      const note = (document.getElementById('qaNote').value || '').trim();
+      if (!doorKey || !startValue || !endValue) {{
+        _showToast('Door, start, and end are required.', false);
+        return;
+      }}
+      const startAt = new Date(startValue);
+      const endAt = new Date(endValue);
+      if (Number.isNaN(startAt.getTime()) || Number.isNaN(endAt.getTime())) {{
+        _showToast('Enter valid start and end times.', false);
+        return;
+      }}
+      try {{
+        const resp = await fetch('/api/manual-access', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{
+            doorKey,
+            startAt: startAt.toISOString(),
+            endAt: endAt.toISOString(),
+            note,
+          }}),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.syncWarning) {{
+          _showToast('Saved, but sync failed: ' + data.syncWarning, false);
+          setTimeout(() => location.reload(), 2200);
+        }} else {{
+          _showToast('Temporary door access scheduled.', true);
+          setTimeout(() => location.reload(), 1200);
+        }}
+      }} catch (err) {{
+        _showToast('Quick access failed: ' + err.message, false);
+      }}
+    }}
+
+    async function cancelManualAccess(btn) {{
+      const id = btn.dataset.id;
+      if (!confirm('Cancel this temporary door access window?')) return;
+      btn.disabled = true;
+      try {{
+        const resp = await fetch('/api/manual-access/cancel', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{ id }}),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.syncWarning) {{
+          _showToast('Canceled, but sync failed: ' + data.syncWarning, false);
+          setTimeout(() => location.reload(), 2200);
+        }} else {{
+          _showToast('Temporary door access canceled.', true);
+          setTimeout(() => location.reload(), 1200);
+        }}
+      }} catch (err) {{
+        _showToast('Cancel failed: ' + err.message, false);
+        btn.disabled = false;
+      }}
+    }}
+
+    document.getElementById('quickAccessForm').addEventListener('submit', submitQuickAccess);
+    setQuickAccessNow();
+    setQuickAccessDuration(30);
 
     async function runSync() {{
       const btn = document.getElementById('syncBtn');
@@ -1669,6 +2026,7 @@ def create_app() -> FastAPI:
 
     async function restoreEvent(btn) {{
       const id = btn.dataset.id;
+      const name = btn.dataset.name || 'Event';
       btn.disabled = true;
       try {{
         const resp = await fetch('/api/events/restore', {{
@@ -1677,7 +2035,7 @@ def create_app() -> FastAPI:
           body: JSON.stringify({{ id }}),
         }});
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        _showToast('Event restored.', true);
+        _showToast('"' + name + '" restored.', true);
         setTimeout(() => location.reload(), 1500);
       }} catch (err) {{
         _showToast('Restore failed: ' + err.message, false);
@@ -1731,12 +2089,14 @@ def create_app() -> FastAPI:
         return _read_mapping()
 
     @app.post("/api/mapping")
-    async def api_mapping_save(payload: dict = Body(...)) -> dict:
+    async def api_mapping_save(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         err = _validate_mapping(payload)
         if err:
+            _audit(request, action="mapping.save", result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
         _write_mapping(payload)
+        _audit(request, action="mapping.save", note=f"rooms={len(payload.get('rooms') or {})}")
         return {"ok": True}
 
     # ── Settings page ────────────────────────────────────────────────────
@@ -1881,12 +2241,18 @@ def create_app() -> FastAPI:
         return load_office_hours(settings.office_hours_file)
 
     @app.post("/api/office-hours")
-    async def api_office_hours_save(payload: dict = Body(...)) -> dict:
+    async def api_office_hours_save(request: Request, payload: dict = Body(...)) -> dict:
         err = validate_office_hours(payload)
         if err:
             from fastapi.responses import JSONResponse
+            _audit(request, action="office_hours.save", result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
         save_office_hours(settings.office_hours_file, payload)
+        _audit(
+            request,
+            action="office_hours.save",
+            note=f"enabled={str(bool(payload.get('enabled'))).lower()}",
+        )
         return {"ok": True}
 
     # ── Office Hours settings page ────────────────────────────────────────
@@ -2064,12 +2430,18 @@ def create_app() -> FastAPI:
         return load_event_overrides(settings.event_overrides_file)
 
     @app.post("/api/event-overrides")
-    async def api_event_overrides_save(payload: dict = Body(...)) -> dict:
+    async def api_event_overrides_save(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         err = validate_event_overrides(payload)
         if err:
+            _audit(request, action="event_overrides.save", result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
         save_event_overrides(settings.event_overrides_file, payload)
+        _audit(
+            request,
+            action="event_overrides.save",
+            note=f"events={len((payload.get('overrides') or {}))}",
+        )
         return {"ok": True}
 
     # ── Event Overrides page ──────────────────────────────────────────────
@@ -2499,15 +2871,17 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/general-settings")
-    async def api_general_settings_save(payload: dict = Body(...)) -> dict:
+    async def api_general_settings_save(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
         # Validate and save lead/lag into mapping file.
         try:
             lead = int(payload.get("unlockLeadMinutes") or 15)
             lag = int(payload.get("unlockLagMinutes") or 15)
         except (ValueError, TypeError):
+            _audit(request, action="general_settings.save", result="error", error="Lead/lag must be integers")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Lead/lag must be integers"})
         if not (0 <= lead <= 120) or not (0 <= lag <= 120):
+            _audit(request, action="general_settings.save", result="error", error="Lead/lag must be 0–120 minutes")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Lead/lag must be 0–120 minutes"})
 
         mapping = _read_mapping()
@@ -2528,13 +2902,16 @@ def create_app() -> FastAPI:
             sv = str(payload.get(start_key) or "05:00").strip()
             ev = str(payload.get(end_key) or _end_defaults[day]).strip()
             if not _time_pat.match(sv):
+                _audit(request, action="general_settings.save", result="error", error=f"{day} start must be HH:MM format")
                 return JSONResponse(status_code=422, content={"ok": False, "error": f"{day} start must be HH:MM format"})
             if not _time_pat.match(ev):
+                _audit(request, action="general_settings.save", result="error", error=f"{day} end must be HH:MM format")
                 return JSONResponse(status_code=422, content={"ok": False, "error": f"{day} end must be HH:MM format"})
             per_day[start_key] = sv
             per_day[end_key]   = ev
 
         save_safe_hours(settings.safe_hours_file, per_day)
+        _audit(request, action="general_settings.save", note=f"lead={lead} lag={lag}")
         return {"ok": True}
 
     # ── System settings helpers ──────────────────────────────────────────────
@@ -2561,20 +2938,23 @@ def create_app() -> FastAPI:
         _env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
     @app.post("/api/system-settings")
-    async def api_system_settings_save(payload: dict = Body(...)) -> dict:
+    async def api_system_settings_save(request: Request, payload: dict = Body(...)) -> dict:
         import asyncio, re as _re
         from fastapi.responses import JSONResponse
 
         cron = str(payload.get("syncCron") or "").strip()
         if cron and not _re.match(r'^[\d\*,\-/]+ [\d\*,\-/]+ [\d\*,\-/]+ [\d\*,\-/]+ [\d\*,\-/]+$', cron):
+            _audit(request, action="system_settings.save", result="error", error="Invalid cron expression")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Invalid cron expression"})
         try:
             lookahead = int(payload.get("lookaheadHours") or 168)
         except (ValueError, TypeError):
+            _audit(request, action="system_settings.save", result="error", error="Lookahead must be an integer")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Lookahead must be an integer"})
         try:
             door_refresh = max(10, int(payload.get("doorStatusRefreshSeconds") or 30))
         except (ValueError, TypeError):
+            _audit(request, action="system_settings.save", result="error", error="Door status refresh must be an integer")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Door status refresh must be an integer"})
 
         updates: dict[str, str] = {}
@@ -2594,6 +2974,11 @@ def create_app() -> FastAPI:
 
         if updates:
             _write_env_vars(updates)
+        _audit(
+            request,
+            action="system_settings.save",
+            note=f"updates={','.join(sorted(updates.keys())) or 'none'}",
+        )
 
         # Restart the service after sending the response.
         async def _restart():

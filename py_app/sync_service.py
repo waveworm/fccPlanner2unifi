@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from py_app.approvals import approve_pending, deny_pending, filter_and_flag_events, load_pending_approvals
 from py_app.event_overrides import load_cancelled_events, load_event_overrides, update_event_memory
+from py_app.manual_access import build_manual_access_windows, list_manual_access
 from py_app.mapping import build_desired_schedule, load_room_door_mapping
 from py_app.office_hours import build_office_hours_windows, load_office_hours, merge_office_hours_into_desired
 from py_app.settings import Settings
@@ -37,6 +38,7 @@ class SyncService:
         self.unifi = UnifiAccessClient(settings)
         self.telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_ids)
         self.status = SyncStatus()
+        self.manual_access_file = str(Path(settings.room_door_mapping_file).resolve().parent / "manual-access-windows.json")
 
         # Apply mode: seed from env var, then override with persisted state if present.
         self._apply_to_unifi: bool = bool(getattr(settings, "apply_to_unifi", False))
@@ -141,6 +143,13 @@ class SyncService:
                 mapping.get("doors") or {},
             )
             desired = merge_office_hours_into_desired(desired, oh_windows)
+            manual_windows = build_manual_access_windows(
+                list_manual_access(self.manual_access_file),
+                from_dt=from_dt,
+                to_dt=to_dt,
+                doors_map=mapping.get("doors") or {},
+            )
+            desired = merge_office_hours_into_desired(desired, manual_windows)
 
             if self._apply_to_unifi:
                 await self.unifi.apply_desired_schedule(desired)
@@ -258,6 +267,13 @@ class SyncService:
             mapping.get("doors") or {},
         )
         desired = merge_office_hours_into_desired(desired, oh_windows)
+        manual_windows = build_manual_access_windows(
+            list_manual_access(self.manual_access_file),
+            from_dt=start_dt,
+            to_dt=end_dt,
+            doors_map=mapping.get("doors") or {},
+        )
+        desired = merge_office_hours_into_desired(desired, manual_windows)
 
         rooms: dict[str, int] = {}
         for e in events:

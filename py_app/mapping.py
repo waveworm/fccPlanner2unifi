@@ -205,4 +205,9 @@ def build_desired_schedule(
     for _door_key, windows in windows_by_door.items():
         merged_door_windows.extend(_merge_windows(windows))
 
-    return {"generatedAt": now_iso, "items": items, "doorWindows": merged_door_windows}
+    return {
+        "generatedAt": now_iso,
+        "items": items,
+        "doorWindows": merged_door_windows,
+        "doorConfigs": doors_map,
+    }
