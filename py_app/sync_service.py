@@ -13,7 +13,13 @@ from py_app.approvals import approve_pending, deny_pending, filter_and_flag_even
 from py_app.event_overrides import load_cancelled_events, load_event_overrides, update_event_memory
 from py_app.manual_access import build_manual_access_windows, list_manual_access
 from py_app.mapping import build_desired_schedule, load_room_door_mapping
-from py_app.office_hours import build_office_hours_windows, load_office_hours, merge_office_hours_into_desired
+from py_app.office_hours import (
+    build_office_hours_windows,
+    get_office_hours_instances,
+    load_cancelled_office_hours,
+    load_office_hours,
+    merge_office_hours_into_desired,
+)
 from py_app.settings import Settings
 from py_app.utils import parse_iso
 from py_app.vendors.pco import PcoClient
@@ -107,6 +113,7 @@ class SyncService:
             # Fix 5: apply the same location filter used by get_preview so behavior is consistent.
             events = self._filter_events_in_window(events, from_dt, to_dt)
             events = self._apply_mapping_exclusions(events, mapping)
+            events = self._filter_events_with_mapped_rooms(events, mapping)
             cancelled_data = load_cancelled_events(self.settings.cancelled_events_file)
             events = self._filter_cancelled_events(events, cancelled_data)
 
@@ -167,6 +174,7 @@ class SyncService:
             self.status.last_sync_result = f"error: {msg}"
             self._push_error(f"{datetime.now(timezone.utc).isoformat()} {msg}")
             self.logger.exception("Sync failed")
+            await self.telegram.notify_sync_error(msg)
             raise
 
     def _apply_mapping_exclusions(self, events: list[dict[str, Any]], mapping: dict[str, Any]) -> list[dict[str, Any]]:
@@ -186,6 +194,37 @@ class SyncService:
                 continue
             out.append(e)
         return out
+
+    @staticmethod
+    def _event_room_candidates(event: dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
+        evt_rooms = event.get("rooms")
+        if isinstance(evt_rooms, list):
+            for room in evt_rooms:
+                room_text = str(room or "").strip()
+                if room_text:
+                    candidates.append(room_text)
+        if not candidates:
+            room_text = str(event.get("room") or "").strip()
+            if room_text:
+                candidates.append(room_text)
+        return list(dict.fromkeys(candidates))
+
+    def _event_has_mapped_room(self, event: dict[str, Any], mapping: dict[str, Any]) -> bool:
+        rooms_map = mapping.get("rooms") or {}
+        doors_map = mapping.get("doors") or {}
+        for room_name in self._event_room_candidates(event):
+            door_keys = rooms_map.get(room_name)
+            if not isinstance(door_keys, list):
+                continue
+            for door_key in door_keys:
+                if str(door_key) in doors_map:
+                    return True
+        return False
+
+    def _filter_events_with_mapped_rooms(self, events: list[dict[str, Any]], mapping: dict[str, Any]) -> list[dict[str, Any]]:
+        """Keep only events that resolve to at least one configured door via room mapping."""
+        return [e for e in events if self._event_has_mapped_room(e, mapping)]
 
     def get_pending_approvals(self) -> list[dict]:
         data = load_pending_approvals(self.settings.pending_approvals_file)
@@ -224,8 +263,9 @@ class SyncService:
                     continue
 
             if must_contain:
-                hay = str(e.get("locationRaw") or e.get("room") or "").lower()
-                if must_contain not in hay:
+                location_raw = str(e.get("locationRaw") or "").strip().lower()
+                # Keep events with blank locationRaw so room/resource-booking mapping can decide relevance.
+                if location_raw and must_contain not in location_raw:
                     continue
             out.append(e)
         out.sort(key=lambda ev: parse_iso(ev.get("startAt")) or datetime.max.replace(tzinfo=timezone.utc))
@@ -234,10 +274,13 @@ class SyncService:
     async def get_preview(self, *, start_dt: datetime, end_dt: datetime, limit: int = 200) -> dict:
         mapping = load_room_door_mapping(self.settings.room_door_mapping_file)
         now = datetime.now(timezone.utc)
+        limit = max(1, int(limit))
+        fetch_limit = max(limit * 4, limit)
 
-        events = await self.pco.get_events(from_iso=start_dt.isoformat(), to_iso=end_dt.isoformat(), max_items=int(limit))
+        events = await self.pco.get_events(from_iso=start_dt.isoformat(), to_iso=end_dt.isoformat(), max_items=fetch_limit)
         events = self._filter_events_in_window(events, start_dt, end_dt)
         events = self._apply_mapping_exclusions(events, mapping)
+        events = self._filter_events_with_mapped_rooms(events, mapping)
         cancelled_data = load_cancelled_events(self.settings.cancelled_events_file)
         events = self._filter_cancelled_events(events, cancelled_data)
 
@@ -251,6 +294,7 @@ class SyncService:
             self.settings.approved_event_names_file,
             self.settings.safe_hours_file,
         )
+        events = events[:limit]
         overrides_cfg = load_event_overrides(self.settings.event_overrides_file)
         desired = build_desired_schedule(
             events=events,
@@ -261,10 +305,12 @@ class SyncService:
         )
 
         oh_config = load_office_hours(self.settings.office_hours_file)
+        cancelled_oh = load_cancelled_office_hours(self.settings.cancelled_office_hours_file)
         oh_windows = build_office_hours_windows(
             oh_config, start_dt, end_dt,
             ZoneInfo(self.settings.display_timezone),
             mapping.get("doors") or {},
+            cancelled_dates=cancelled_oh,
         )
         desired = merge_office_hours_into_desired(desired, oh_windows)
         manual_windows = build_manual_access_windows(
@@ -284,7 +330,7 @@ class SyncService:
             "now": now.isoformat(),
             "start": start_dt.isoformat(),
             "end": end_dt.isoformat(),
-            "limit": int(limit),
+            "limit": limit,
             "rooms": rooms,
             "events": events,
             "schedule": desired,
@@ -304,9 +350,31 @@ class SyncService:
             if (lambda end: end is None or end >= now)(parse_iso(e.get("endAt")))
         ]
 
-        # Recompute rooms from the filtered event list.
+        # Append office hours instances as synthetic events.
+        local_tz = ZoneInfo(self.settings.display_timezone)
+        oh_config = load_office_hours(self.settings.office_hours_file)
+        cancelled_oh = load_cancelled_office_hours(self.settings.cancelled_office_hours_file)
+        oh_instances = get_office_hours_instances(
+            oh_config, now, end_dt, local_tz, cancelled_dates=cancelled_oh,
+        )
+        # Filter out already-finished office hours instances.
+        oh_instances = [
+            e for e in oh_instances
+            if (lambda end: end is None or end >= now)(parse_iso(e.get("endAt")))
+        ]
+        result["events"].extend(oh_instances)
+
+        # Sort combined list by startAt.
+        def _sort_key(e: dict) -> str:
+            return str(e.get("startAt") or "")
+        result["events"].sort(key=_sort_key)
+        result["events"] = result["events"][: max(1, int(limit))]
+
+        # Recompute rooms from PCO events only (exclude office hours synthetic entries).
         rooms: dict[str, int] = {}
         for e in result["events"]:
+            if e.get("type") == "office_hours":
+                continue
             room = e.get("room") or "(none)"
             rooms[room] = rooms.get(room, 0) + 1
         result["rooms"] = rooms

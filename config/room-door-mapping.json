@@ -23,6 +23,38 @@
       "unifiDoorIds": [
         "38357452-65f5-4d3e-babc-6e34ce0aa4f7"
       ]
+    },
+    "gym_rear": {
+      "label": "Gym Rear",
+      "unifiDoorIds": [
+        "f975beeb-216d-4bbe-9542-78d5b6c2ca2a"
+      ]
+    }
+  },
+  "doorGroups": {
+    "lobby_group": {
+      "label": "Lobby Group",
+      "doorKeys": [
+        "front_lobby",
+        "rear_lobby"
+      ]
+    },
+    "gym_group": {
+      "label": "Gym Group",
+      "doorKeys": [
+        "gym_front",
+        "gym_rear"
+      ]
+    },
+    "all_doors": {
+      "label": "All Doors",
+      "doorKeys": [
+        "front_lobby",
+        "rear_lobby",
+        "office",
+        "gym_front",
+        "gym_rear"
+      ]
     }
   },
   "rooms": {

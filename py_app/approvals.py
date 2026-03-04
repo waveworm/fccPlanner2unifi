@@ -275,6 +275,20 @@ def filter_and_flag_events(
         newly_flagged.append(entry)
         changed = True
 
+    # Remove stale pending/denied entries that are no longer in the current filtered event set.
+    # This prevents orphaned approval rows when upstream filters intentionally exclude an event
+    # (for example, unmapped/no-door locations).
+    current_ids = {str(e.get("id") or "") for e in events if str(e.get("id") or "")}
+    kept_items: list[dict[str, Any]] = []
+    for item in pending_items:
+        item_id = str(item.get("id") or "")
+        status = str(item.get("status") or "pending")
+        if status in {"pending", "denied"} and item_id and item_id not in current_ids:
+            changed = True
+            continue
+        kept_items.append(item)
+    pending_items = kept_items
+
     pending_items = _prune_pending(pending_items)
     if changed or len(pending_items) != len(pending_data.get("pending") or []):
         pending_data["pending"] = pending_items

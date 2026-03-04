@@ -82,12 +82,103 @@ def parse_time_ranges(text: str) -> list[tuple[str, str]]:
     return ranges
 
 
+def load_cancelled_office_hours(file_path: str) -> set[str]:
+    """Load the set of cancelled office hours date strings (YYYY-MM-DD)."""
+    path = Path(file_path)
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return set(data.get("dates") or [])
+    except Exception:
+        return set()
+
+
+def _save_cancelled_office_hours(file_path: str, dates: set[str]) -> None:
+    path = Path(file_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Auto-prune dates that are in the past
+    today = datetime.now(timezone.utc).date().isoformat()
+    pruned = {d for d in dates if d >= today}
+    path.write_text(json.dumps({"dates": sorted(pruned)}, indent=2) + "\n", encoding="utf-8")
+
+
+def add_cancelled_office_hours_date(file_path: str, date_str: str) -> None:
+    dates = load_cancelled_office_hours(file_path)
+    dates.add(date_str)
+    _save_cancelled_office_hours(file_path, dates)
+
+
+def remove_cancelled_office_hours_date(file_path: str, date_str: str) -> None:
+    dates = load_cancelled_office_hours(file_path)
+    dates.discard(date_str)
+    _save_cancelled_office_hours(file_path, dates)
+
+
+def get_office_hours_instances(
+    config: dict[str, Any],
+    from_dt: datetime,
+    to_dt: datetime,
+    local_tz: ZoneInfo,
+    cancelled_dates: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return synthetic event-like dicts for each upcoming office hours day (for dashboard display)."""
+    if not config.get("enabled"):
+        return []
+    cancelled = cancelled_dates or set()
+    schedule = config.get("schedule") or {}
+    instances = []
+
+    current_date = from_dt.astimezone(local_tz).date()
+    end_date = to_dt.astimezone(local_tz).date()
+
+    while current_date <= end_date:
+        date_str = current_date.isoformat()
+        day_name = DAYS[current_date.weekday()]
+        day_cfg = schedule.get(day_name) or {}
+        ranges_text = (day_cfg.get("ranges") or "").strip()
+        door_keys: list[str] = [str(d) for d in (day_cfg.get("doors") or []) if d]
+
+        if ranges_text and door_keys and date_str not in cancelled:
+            ranges = parse_time_ranges(ranges_text)
+            if ranges:
+                sh, sm = map(int, ranges[0][0].split(":"))
+                eh, em = map(int, ranges[-1][1].split(":"))
+                local_start = datetime(
+                    current_date.year, current_date.month, current_date.day,
+                    sh, sm, 0, tzinfo=local_tz,
+                )
+                local_end = datetime(
+                    current_date.year, current_date.month, current_date.day,
+                    eh, em, 0, tzinfo=local_tz,
+                )
+                instances.append({
+                    "id": f"office-hours-{date_str}",
+                    "name": "Office Hours",
+                    "startAt": local_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "endAt": local_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "room": ranges_text,
+                    "rooms": [],
+                    "building": "",
+                    "locationRaw": "",
+                    "type": "office_hours",
+                    "dateStr": date_str,
+                    "timeRanges": ranges_text,
+                    "doors": door_keys,
+                })
+
+        current_date += timedelta(days=1)
+
+    return instances
+
+
 def build_office_hours_windows(
     config: dict[str, Any],
     from_dt: datetime,
     to_dt: datetime,
     local_tz: ZoneInfo,
     doors_map: dict[str, Any],
+    cancelled_dates: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Generate door-unlock windows for every date in [from_dt, to_dt] where office hours apply.
 
@@ -97,6 +188,7 @@ def build_office_hours_windows(
     if not config.get("enabled"):
         return []
 
+    cancelled = cancelled_dates or set()
     schedule = config.get("schedule") or {}
     windows: list[dict[str, Any]] = []
 
@@ -109,7 +201,7 @@ def build_office_hours_windows(
         ranges_text = (day_cfg.get("ranges") or "").strip()
         door_keys: list[str] = [str(d) for d in (day_cfg.get("doors") or []) if d]
 
-        if not ranges_text or not door_keys:
+        if not ranges_text or not door_keys or current_date.isoformat() in cancelled:
             current_date += timedelta(days=1)
             continue
 

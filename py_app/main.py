@@ -33,7 +33,14 @@ from py_app.manual_access import (
 )
 from py_app.approvals import load_safe_hours, save_safe_hours
 from py_app.logger import get_logger
-from py_app.office_hours import load_office_hours, save_office_hours, validate_office_hours
+from py_app.office_hours import (
+    add_cancelled_office_hours_date,
+    load_cancelled_office_hours,
+    load_office_hours,
+    remove_cancelled_office_hours_date,
+    save_office_hours,
+    validate_office_hours,
+)
 from py_app.settings import Settings
 from py_app.sync_service import SyncService
 from py_app.vendors.unifi_access import UnifiAccessClient
@@ -330,6 +337,13 @@ def create_app() -> FastAPI:
             extra=extra,
         )
 
+    async def _notify(request: Request, message: str) -> None:
+        """Send a Telegram notification for a manual user action (no-ops if not configured)."""
+        from py_app.audit import resolve_request_actor
+        actor = resolve_request_actor(request, tailscale_peers_file)
+        display = actor.get("displayName") or actor.get("requestIp") or "Someone"
+        await sync_service.telegram.notify_user_action(display, message)
+
     def _nav(active: str) -> str:
         """Generate the shared site header HTML."""
         pages = [
@@ -476,10 +490,13 @@ def create_app() -> FastAPI:
         from datetime import datetime, timedelta
 
         now = datetime.now(timezone.utc)
+        lookbehind_hours = max(int(settings.sync_lookbehind_hours), 24)
+        start_dt = now - timedelta(hours=lookbehind_hours)
         end_dt = now + timedelta(hours=int(settings.sync_lookahead_hours))
-        preview = await sync_service.get_preview(start_dt=now, end_dt=end_dt)
+        preview = await sync_service.get_preview(start_dt=start_dt, end_dt=end_dt)
         door_windows = (preview.get("schedule") or {}).get("doorWindows") or []
 
+        mapping_cfg: dict = {}
         try:
             from py_app.mapping import load_room_door_mapping
             mapping_cfg = load_room_door_mapping(settings.room_door_mapping_file)
@@ -520,6 +537,44 @@ def create_app() -> FastAPI:
                     })
                 cur = next_mid
 
+        # Merge overlapping day-minute windows per door.
+        # The sync window spans >7 days so the same day-of-week can appear from two
+        # different calendar weeks.  Collapsing them here gives one unified bar per
+        # day on the weekly timeline, with all contributing event names combined.
+        for key in list(door_map.keys()):
+            by_day: dict[int, list] = {}
+            for w in door_map[key]["windows"]:
+                by_day.setdefault(w["day"], []).append(w)
+            merged_wins: list[dict] = []
+            for day_wins in by_day.values():
+                day_wins.sort(key=lambda w: w["startMin"])
+                cur: dict | None = None
+                for w in day_wins:
+                    if cur is None:
+                        cur = {**w, "events": list(w["events"])}
+                    elif w["startMin"] <= cur["endMin"]:
+                        cur["endMin"] = max(cur["endMin"], w["endMin"])
+                        for ev in w["events"]:
+                            if ev not in cur["events"]:
+                                cur["events"].append(ev)
+                    else:
+                        merged_wins.append(cur)
+                        cur = {**w, "events": list(w["events"])}
+                if cur is not None:
+                    merged_wins.append(cur)
+            door_map[key]["windows"] = merged_wins
+
+        # Ensure all configured doors appear (empty windows if none scheduled)
+        doors_cfg = mapping_cfg.get("doors") or {}
+        for dk in all_door_keys:
+            if dk not in door_map:
+                label = str((doors_cfg.get(dk) or {}).get("label") or dk)
+                door_map[dk] = {
+                    "key": dk,
+                    "label": label,
+                    "color": color_for_key.get(dk, _DOOR_COLORS[0]),
+                    "windows": [],
+                }
         # Return in mapping order so colors and display order stay consistent
         ordered = [door_map[dk] for dk in all_door_keys if dk in door_map]
         ordered += [v for dk, v in door_map.items() if dk not in all_door_keys]
@@ -603,6 +658,7 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
         name = sync_service.approve_event(event_id)
         _audit(request, action="approval.approve", target=event_id, note=name or "")
+        await _notify(request, f"Approved after-hours event: {name or event_id}")
         return {"ok": True, "name": name}
 
     @app.post("/api/approvals/deny")
@@ -614,6 +670,7 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
         name = sync_service.deny_event(event_id)
         _audit(request, action="approval.deny", target=event_id, note=name or "")
+        await _notify(request, f"Denied after-hours event: {name or event_id}")
         return {"ok": True, "name": name}
 
     @app.get("/api/events/cancelled")
@@ -632,6 +689,7 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=422, content={"ok": False, "error": "id required"})
         add_cancelled_event(settings.cancelled_events_file, event_id, name, start_at, end_at)
         _audit(request, action="event.cancel", target=event_id, note=name)
+        await _notify(request, f"Cancelled event: {name or event_id}")
         return {"ok": True}
 
     @app.post("/api/events/restore")
@@ -648,6 +706,7 @@ def create_app() -> FastAPI:
                 break
         remove_cancelled_event(settings.cancelled_events_file, event_id)
         _audit(request, action="event.restore", target=event_id, note=restored_name)
+        await _notify(request, f"Restored cancelled event: {restored_name or event_id}")
         return {"ok": True}
 
     @app.get("/api/manual-access")
@@ -658,34 +717,50 @@ def create_app() -> FastAPI:
     async def api_manual_access_create(request: Request, payload: dict = Body(...)) -> dict:
         from fastapi.responses import JSONResponse
 
-        door_key = str(payload.get("doorKey") or "").strip()
+        # Accept doorKeys array (primary) or legacy single doorKey
+        raw_keys = payload.get("doorKeys")
+        if raw_keys and isinstance(raw_keys, list):
+            door_keys_raw = [str(k).strip() for k in raw_keys if str(k).strip()]
+        else:
+            single = str(payload.get("doorKey") or "").strip()
+            door_keys_raw = [single] if single else []
         start_at = str(payload.get("startAt") or "").strip()
         end_at = str(payload.get("endAt") or "").strip()
         note = str(payload.get("note") or "").strip()
         mapping = _read_mapping()
         doors_map = mapping.get("doors") or {}
-        if not door_key or door_key not in doors_map:
-            err = "Select a valid door"
+        if not door_keys_raw:
+            err = "Select a door or group"
             _audit(request, action="manual_access.create", result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
-        err = validate_manual_access_window(start_at=start_at, end_at=end_at, door_keys=[door_key])
+        invalid_keys = [k for k in door_keys_raw if k not in doors_map]
+        if invalid_keys:
+            err = f"Unknown door key(s): {', '.join(invalid_keys)}"
+            _audit(request, action="manual_access.create", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        if not note:
+            err = "Description is required"
+            _audit(request, action="manual_access.create", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        err = validate_manual_access_window(start_at=start_at, end_at=end_at, door_keys=door_keys_raw)
         if err:
-            _audit(request, action="manual_access.create", target=door_key, result="error", error=err)
+            _audit(request, action="manual_access.create", target=",".join(door_keys_raw), result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
         entry = create_manual_access_entry(
             manual_access_file,
-            door_keys=[door_key],
+            door_keys=door_keys_raw,
             start_at=start_at,
             end_at=end_at,
             note=note,
         )
-        door_label = str((doors_map.get(door_key) or {}).get("label") or door_key)
+        door_labels = ", ".join(str((doors_map.get(k) or {}).get("label") or k) for k in door_keys_raw)
         _audit(
             request,
             action="manual_access.create",
             target=str(entry.get("id") or ""),
-            note=f"{door_label} {start_at} -> {end_at}" + (f" ({note})" if note else ""),
+            note=f"{door_labels} {start_at} -> {end_at} ({note})",
         )
+        await _notify(request, f"Quick Door Access scheduled: {door_labels} — {note} ({start_at} → {end_at})")
         sync_warning = ""
         try:
             await sync_service.run_once()
@@ -713,12 +788,15 @@ def create_app() -> FastAPI:
             str((doors_map.get(dk) or {}).get("label") or dk)
             for dk in (removed.get("doorKeys") or [])
         ]
+        _removed_doors = ", ".join([n for n in door_names if n]) or "unknown"
+        _removed_note = str(removed.get("note") or "")
         _audit(
             request,
             action="manual_access.cancel",
             target=entry_id,
-            note=", ".join([name for name in door_names if name]) or str(removed.get("note") or ""),
+            note=_removed_doors + (f" ({_removed_note})" if _removed_note else ""),
         )
+        await _notify(request, f"Quick Door Access cancelled: {_removed_doors}" + (f" — {_removed_note}" if _removed_note else ""))
         sync_warning = ""
         try:
             await sync_service.run_once()
@@ -803,6 +881,7 @@ def create_app() -> FastAPI:
         cancelled_data = load_cancelled_events(settings.cancelled_events_file)
         cancelled_instances = cancelled_data.get("instances") or []
         cancelled_ids = {str(i.get("id")) for i in cancelled_instances if i.get("id")}
+        cancelled_oh_dates = load_cancelled_office_hours(settings.cancelled_office_hours_file)
 
         try:
             _ov_data = load_event_overrides(settings.event_overrides_file)
@@ -855,11 +934,21 @@ def create_app() -> FastAPI:
             doors_map = mapping.get("doors") or {}
 
         manual_entries = list_manual_access(manual_access_file)
-        door_options_html = "".join(
-            [
-                f'<option value="{_esc(dk, quote=True)}">{_esc(str((doors_map.get(dk) or {}).get("label") or dk))}</option>'
-                for dk in door_keys
-            ]
+        door_groups_cfg: dict = (mapping.get("doorGroups") or {}) if isinstance(mapping, dict) else {}
+        _indiv_opts = "".join(
+            f'<option value="single:{_esc(dk, quote=True)}">'
+            f'{_esc(str((doors_map.get(dk) or {}).get("label") or dk))}</option>'
+            for dk in door_keys
+        )
+        _group_opts = "".join(
+            f'<option value="group:{_esc(gk, quote=True)}"'
+            f' data-keys="{_esc(",".join(str(k) for k in (gv.get("doorKeys") or [])), quote=True)}">'
+            f'{_esc(str(gv.get("label") or gk))}</option>'
+            for gk, gv in door_groups_cfg.items()
+        )
+        door_options_html = (
+            (f'<optgroup label="Individual Doors">{_indiv_opts}</optgroup>' if _indiv_opts else "")
+            + (f'<optgroup label="Door Groups">{_group_opts}</optgroup>' if _group_opts else "")
         )
         manual_rows = []
         for entry in manual_entries:
@@ -931,16 +1020,54 @@ def create_app() -> FastAPI:
         for e in preview_events:
             eid = str(e.get("id") or "")
             _doors_cfg = (mapping.get("doors") or {}) if isinstance(mapping, dict) else {}
-            _door_spans = []
-            for _dk in event_doors.get(eid, []):
-                _color = door_color_map.get(_dk, "#6b7280")
-                _lbl = str((_doors_cfg.get(_dk) or {}).get("label") or _dk)
-                _door_spans.append(f'<span style="color:{_color};font-weight:600">{_esc(_lbl)}</span>')
-            doors_html = ", ".join(_door_spans) or '<span style="color:#9ca3af">(none mapped)</span>'
-            rooms_str = ", ".join(e["rooms"]) if e.get("rooms") else str(e.get("room") or "")
+            is_oh = e.get("type") == "office_hours"
+
+            if is_oh:
+                # Office hours: show configured door labels in color
+                oh_door_keys: list[str] = e.get("doors") or []
+                _door_spans = []
+                for _dk in oh_door_keys:
+                    _color = door_color_map.get(_dk, "#6b7280")
+                    _lbl = str((_doors_cfg.get(_dk) or {}).get("label") or _dk)
+                    _door_spans.append(f'<span style="color:{_color};font-weight:600">{_esc(_lbl)}</span>')
+                doors_html = ", ".join(_door_spans) or '<span style="color:#9ca3af">(none mapped)</span>'
+                rooms_str = _esc(str(e.get("timeRanges") or ""))
+            else:
+                _door_spans = []
+                for _dk in event_doors.get(eid, []):
+                    _color = door_color_map.get(_dk, "#6b7280")
+                    _lbl = str((_doors_cfg.get(_dk) or {}).get("label") or _dk)
+                    _door_spans.append(f'<span style="color:{_color};font-weight:600">{_esc(_lbl)}</span>')
+                doors_html = ", ".join(_door_spans) or '<span style="color:#9ca3af">(none mapped)</span>'
+                rooms_str = _esc(", ".join(e["rooms"]) if e.get("rooms") else str(e.get("room") or ""))
+
             ename = str(e.get("name") or "")
             estart = str(e.get("startAt") or "")
             eend = str(e.get("endAt") or "")
+
+            if is_oh:
+                oh_badge = (
+                    ' <span style="font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;'
+                    'background:#d1fae5;color:#065f46;vertical-align:middle">Office Hours</span>'
+                )
+                date_str = _esc(str(e.get("dateStr") or ""))
+                cancel_btn = (
+                    f'<button class="sm danger" '
+                    f'data-date="{date_str}" data-name="{_esc(ename)}" '
+                    f'onclick="cancelOfficeHoursDay(this)">Cancel</button>'
+                )
+                events_rows_list.append(
+                    '<tr style="background:#f0fdf4">'
+                    f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
+                    f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
+                    f"<td><strong>{_esc(ename)}</strong>{oh_badge}</td>"
+                    f'<td class="hide-mob">{rooms_str}</td>'
+                    f'<td class="hide-mob">{doors_html}</td>'
+                    f'<td style="white-space:nowrap">{cancel_btn}</td>'
+                    "</tr>"
+                )
+                continue
+
             ename_lower = ename.lower()
             ov_key = next((k for k in dash_overrides if k.lower() == ename_lower), None)
             has_override = ov_key is not None
@@ -1006,7 +1133,7 @@ def create_app() -> FastAPI:
                 f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
                 f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
                 f"<td><strong>{_esc(ename)}</strong>{override_badge}{override_detail_html}</td>"
-                f'<td class="hide-mob">{_esc(rooms_str)}</td>'
+                f'<td class="hide-mob">{rooms_str}</td>'
                 f'<td class="hide-mob">{doors_html}</td>'
                 f'<td style="white-space:nowrap">{cancel_btn}<br/>{override_btn}</td>'
                 "</tr>"
@@ -1014,7 +1141,31 @@ def create_app() -> FastAPI:
         events_rows = "\n".join(events_rows_list)
 
         # Cancelled events warning card HTML
-        if cancelled_instances:
+        # Build cancelled OH rows sorted by date
+        from datetime import date as _date_type
+        cancelled_oh_rows = []
+        for _ds in sorted(cancelled_oh_dates):
+            try:
+                _d = _date_type.fromisoformat(_ds)
+                _day_label = _d.strftime("%A, %b %-d")
+            except Exception:
+                _day_label = _ds
+            restore_oh_btn = (
+                f'<button class="sm" data-date="{_esc(_ds)}" '
+                f'onclick="restoreOfficeHoursDay(this)">Restore</button>'
+            )
+            cancelled_oh_rows.append(
+                f"<tr>"
+                f'<td style="white-space:nowrap">{_esc(_day_label)}</td>'
+                f'<td><strong>Office Hours</strong> '
+                f'<span style="font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;'
+                f'background:#d1fae5;color:#065f46;vertical-align:middle">Office Hours</span></td>'
+                f"<td>{restore_oh_btn}</td>"
+                f"</tr>"
+            )
+
+        total_cancelled = len(cancelled_instances) + len(cancelled_oh_rows)
+        if total_cancelled > 0:
             cancelled_rows = []
             for inst in cancelled_instances:
                 iid = str(inst.get("id") or "")
@@ -1031,17 +1182,17 @@ def create_app() -> FastAPI:
                     f"<td>{restore_btn}</td>"
                     f"</tr>"
                 )
-            cancelled_rows_html = "\n".join(cancelled_rows)
+            cancelled_rows_html = "\n".join(cancelled_rows) + "\n".join(cancelled_oh_rows)
             cancelled_card_html = f"""
     <div class="card" style="border-color:#fca5a5;background:#fff8f8;">
-      <span class="card-title" style="color:#dc2626;">&#9888; Cancelled Events ({len(cancelled_instances)})</span>
+      <span class="card-title" style="color:#dc2626;">&#9888; Cancelled ({total_cancelled})</span>
       <p style="font-size:13px;color:#7f1d1d;margin:0 0 12px;">
-        These events are suppressed from the door schedule until restored or until 24 hours after they end.
+        These are suppressed from the door schedule until restored.
       </p>
       <div style="overflow:auto;">
         <table>
           <thead>
-            <tr><th>Scheduled Start</th><th>Event</th><th>Action</th></tr>
+            <tr><th>Date / Start</th><th>Event</th><th>Action</th></tr>
           </thead>
           <tbody>
             {cancelled_rows_html}
@@ -1272,17 +1423,20 @@ def create_app() -> FastAPI:
     {pending_card_html}
 
     <details class="collapsible">
-      <summary><span>Quick Door Access</span></summary>
+      <summary>
+        <span>Quick Door Access</span>
+        {f'<span style="margin-left:8px;font-size:12px;font-weight:700;padding:1px 7px;border-radius:10px;background:#dbeafe;color:#1d4ed8;vertical-align:middle">{len(manual_entries)} active</span>' if manual_entries else ""}
+      </summary>
       <div class="details-body">
         <p style="font-size:13px;color:#64748b;margin:0 0 12px;">
-          Create a temporary unlock window for one door group without changing PCO or office hours. The picker uses this device's local time; saved windows are displayed below in <strong>{_esc(settings.display_timezone)}</strong>.
+          Create a temporary unlock window for one door group without changing PCO or office hours. The picker uses this device's local time; times are shown in <strong>{_esc(settings.display_timezone)}</strong>.
         </p>
         <form id="quickAccessForm">
           <div class="quick-access-grid">
             <div>
               <label for="qaDoor">Door Group</label>
               <select id="qaDoor" required>
-                <option value="">Select a door…</option>
+                <option value="">Select a door or group…</option>
                 {door_options_html}
               </select>
             </div>
@@ -1295,8 +1449,8 @@ def create_app() -> FastAPI:
               <input id="qaEndAt" type="datetime-local" required />
             </div>
             <div>
-              <label for="qaNote">Note</label>
-              <input id="qaNote" type="text" maxlength="120" placeholder="Optional reason" />
+              <label for="qaNote">Description <span style="color:#ef4444">*</span></label>
+              <input id="qaNote" type="text" maxlength="120" placeholder="e.g. Special event – extra access needed" required />
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;">
@@ -1308,16 +1462,23 @@ def create_app() -> FastAPI:
             <button type="submit" class="primary sm">Schedule Access</button>
           </div>
         </form>
-        <div style="overflow:auto;margin-top:14px;">
-          <table>
-            <thead><tr><th>Door</th><th>Start</th><th>End</th><th>Note</th><th>Action</th></tr></thead>
-            <tbody>
-              {manual_rows_html or '<tr><td colspan="5" style="padding:12px;color:#9ca3af;">No manual door access windows scheduled.</td></tr>'}
-            </tbody>
-          </table>
-        </div>
       </div>
     </details>
+    {"" if not manual_entries else f"""
+    <div class="card" style="border-color:#bfdbfe;background:#eff6ff;padding:12px 16px;margin-top:-4px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <span style="font-weight:700;font-size:14px;color:#1e40af;">&#128274; Scheduled Manual Access</span>
+        <span style="font-size:12px;font-weight:700;padding:1px 7px;border-radius:10px;background:#dbeafe;color:#1d4ed8;">{len(manual_entries)} window{"s" if len(manual_entries) != 1 else ""}</span>
+      </div>
+      <div style="overflow:auto;">
+        <table>
+          <thead><tr><th>Door</th><th>Start</th><th>End</th><th>Description</th><th>Action</th></tr></thead>
+          <tbody>
+            {manual_rows_html}
+          </tbody>
+        </table>
+      </div>
+    </div>"""}
 
     <!-- Door Status -->
     <div class="card" id="doorStatusCard">
@@ -1460,12 +1621,25 @@ def create_app() -> FastAPI:
 
     async function submitQuickAccess(event) {{
       event.preventDefault();
-      const doorKey = document.getElementById('qaDoor').value;
+      const sel = document.getElementById('qaDoor');
+      const selVal = sel.value;
+      let doorKeys = [];
+      if (selVal.startsWith('single:')) {{
+        doorKeys = [selVal.slice(7)];
+      }} else if (selVal.startsWith('group:')) {{
+        const opt = sel.options[sel.selectedIndex];
+        doorKeys = (opt.dataset.keys || '').split(',').filter(Boolean);
+      }}
       const startValue = document.getElementById('qaStartAt').value;
       const endValue = document.getElementById('qaEndAt').value;
       const note = (document.getElementById('qaNote').value || '').trim();
-      if (!doorKey || !startValue || !endValue) {{
+      if (!doorKeys.length || !startValue || !endValue) {{
         _showToast('Door, start, and end are required.', false);
+        return;
+      }}
+      if (!note) {{
+        _showToast('Description is required.', false);
+        document.getElementById('qaNote').focus();
         return;
       }}
       const startAt = new Date(startValue);
@@ -1479,7 +1653,7 @@ def create_app() -> FastAPI:
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
           body: JSON.stringify({{
-            doorKey,
+            doorKeys,
             startAt: startAt.toISOString(),
             endAt: endAt.toISOString(),
             note,
@@ -1558,6 +1732,43 @@ def create_app() -> FastAPI:
         setTimeout(() => location.reload(), 1500);
       }} catch (err) {{
         _showToast('Cancel failed: ' + err.message, false);
+        btn.disabled = false;
+      }}
+    }}
+
+    async function cancelOfficeHoursDay(btn) {{
+      const date = btn.dataset.date, name = 'Office Hours on ' + date;
+      if (!confirm('Cancel ' + name + '? The doors will not open for office hours that day.')) return;
+      btn.disabled = true;
+      try {{
+        const resp = await fetch('/api/office-hours/cancel', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{ date }}),
+        }});
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        _showToast('Office Hours cancelled for ' + date + '.', true);
+        setTimeout(() => location.reload(), 1500);
+      }} catch (err) {{
+        _showToast('Cancel failed: ' + err.message, false);
+        btn.disabled = false;
+      }}
+    }}
+
+    async function restoreOfficeHoursDay(btn) {{
+      const date = btn.dataset.date;
+      btn.disabled = true;
+      try {{
+        const resp = await fetch('/api/office-hours/restore', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{ date }}),
+        }});
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        _showToast('Office Hours restored for ' + date + '.', true);
+        setTimeout(() => location.reload(), 1500);
+      }} catch (err) {{
+        _showToast('Restore failed: ' + err.message, false);
         btn.disabled = false;
       }}
     }}
@@ -1922,7 +2133,7 @@ def create_app() -> FastAPI:
 
     async function saveOverrideModal() {{
       if (!_ovCurrentName) return;
-      const timeRe = /^\d{{1,2}}:\d{{2}}$/;
+      const timeRe = /^\\d{{1,2}}:\\d{{2}}$/;
       const doorOverrides = {{}};
       for (const dk of OV_DOOR_KEYS) {{
         const chk = document.getElementById('ovChk_' + dk);
@@ -2255,6 +2466,34 @@ def create_app() -> FastAPI:
         )
         return {"ok": True}
 
+    @app.get("/api/office-hours/cancelled")
+    async def api_oh_cancelled() -> dict:
+        return {"dates": sorted(load_cancelled_office_hours(settings.cancelled_office_hours_file))}
+
+    @app.post("/api/office-hours/cancel")
+    async def api_oh_cancel(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+        date_str = str(payload.get("date") or "").strip()
+        if not date_str:
+            _audit(request, action="office_hours.cancel_day", result="error", error="date required")
+            return JSONResponse(status_code=422, content={"ok": False, "error": "date required"})
+        add_cancelled_office_hours_date(settings.cancelled_office_hours_file, date_str)
+        _audit(request, action="office_hours.cancel_day", target=date_str)
+        await _notify(request, f"Office Hours cancelled for {date_str}")
+        return {"ok": True}
+
+    @app.post("/api/office-hours/restore")
+    async def api_oh_restore(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+        date_str = str(payload.get("date") or "").strip()
+        if not date_str:
+            _audit(request, action="office_hours.restore_day", result="error", error="date required")
+            return JSONResponse(status_code=422, content={"ok": False, "error": "date required"})
+        remove_cancelled_office_hours_date(settings.cancelled_office_hours_file, date_str)
+        _audit(request, action="office_hours.restore_day", target=date_str)
+        await _notify(request, f"Office Hours restored for {date_str}")
+        return {"ok": True}
+
     # ── Office Hours settings page ────────────────────────────────────────
 
     @app.get("/office-hours", response_class=HTMLResponse)
@@ -2437,11 +2676,14 @@ def create_app() -> FastAPI:
             _audit(request, action="event_overrides.save", result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
         save_event_overrides(settings.event_overrides_file, payload)
+        ov_names = list((payload.get("overrides") or {}).keys())
         _audit(
             request,
             action="event_overrides.save",
-            note=f"events={len((payload.get('overrides') or {}))}",
+            note=f"events={len(ov_names)}",
         )
+        if ov_names:
+            await _notify(request, f"Event time overrides saved for: {', '.join(ov_names[:5])}" + (" …" if len(ov_names) > 5 else ""))
         return {"ok": True}
 
     # ── Event Overrides page ──────────────────────────────────────────────
@@ -2989,6 +3231,16 @@ def create_app() -> FastAPI:
         asyncio.create_task(_restart())
         return {"ok": True, "restarting": True}
 
+    @app.post("/api/notifications/test")
+    async def api_notifications_test(request: Request) -> dict:
+        from fastapi.responses import JSONResponse
+        err = await sync_service.telegram.send_test()
+        if err:
+            _audit(request, action="notifications.test", result="error", error=err)
+            return JSONResponse(status_code=502, content={"ok": False, "error": err})
+        _audit(request, action="notifications.test")
+        return {"ok": True}
+
     # ── General Settings page ────────────────────────────────────────────────
 
     @app.get("/general-settings", response_class=HTMLResponse)
@@ -3217,6 +3469,20 @@ def create_app() -> FastAPI:
           in a browser and look for <code>"id"</code> inside the <code>"chat"</code> object.
           Multiple recipients: separate IDs with commas (no spaces).
         </p>
+        {"" if not telegram_ok else """
+        <div style="margin-top:10px;">
+          <button type="button" class="sm" onclick="sendTelegramTest(this)">Send test message</button>
+          <span id="telegramTestNote" style="font-size:13px;margin-left:8px;"></span>
+        </div>
+        <p class="field-note" style="margin-top:6px;">
+          Sends a test message to all configured chat IDs using the <em>currently saved</em> token and chat IDs.
+          Save first if you just made changes.
+        </p>
+        """}
+        <p style="font-size:13px;color:#64748b;margin:8px 0 0;"><strong>Notifications sent:</strong>
+          after-hours event flagged for approval (one message per sync cycle with new flags);
+          sync errors.
+        </p>
       </div>
 
       <div style="display:flex;gap:10px;align-items:center;margin-bottom:24px;">
@@ -3307,6 +3573,25 @@ def create_app() -> FastAPI:
         btn.disabled = false;
       }}
     }});
+
+    async function sendTelegramTest(btn) {{
+      btn.disabled = true;
+      const note = document.getElementById("telegramTestNote");
+      note.style.color = "#64748b";
+      note.textContent = "Sending…";
+      try {{
+        const resp = await fetch("/api/notifications/test", {{ method: "POST" }});
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || "HTTP " + resp.status);
+        note.style.color = "#16a34a";
+        note.textContent = "✓ Message sent successfully.";
+      }} catch (err) {{
+        note.style.color = "#dc2626";
+        note.textContent = "✗ " + err.message;
+      }} finally {{
+        btn.disabled = false;
+      }}
+    }}
   </script>
 </body>
 </html>"""

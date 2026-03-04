@@ -138,14 +138,21 @@ Current doors configured (in display order):
 ```json
 {
   "doors": {
-    "front_lobby": { "label": "Front Lobby",  "unifiDoorIds": ["b5f778e6-0c3a-49cd-8f4f-06a7011ee8cd"] },
-    "rear_lobby":  { "label": "Rear Lobby",   "unifiDoorIds": ["cdf39816-e069-4b4f-8972-918ca1ac9604"] },
-    "office":      { "label": "Office",       "unifiDoorIds": ["3dac1155-e5f8-47c3-96e6-d89c914491f6"] },
-    "gym_front":   { "label": "Gym Front",    "unifiDoorIds": ["38357452-65f5-4d3e-babc-6e34ce0aa4f7"] }
+    "front_lobby": { "label": "Front Lobby", "unifiDoorIds": ["b5f778e6-0c3a-49cd-8f4f-06a7011ee8cd"] },
+    "rear_lobby":  { "label": "Rear Lobby",  "unifiDoorIds": ["cdf39816-e069-4b4f-8972-918ca1ac9604"] },
+    "office":      { "label": "Office",      "unifiDoorIds": ["3dac1155-e5f8-47c3-96e6-d89c914491f6"] },
+    "gym_front":   { "label": "Gym Front",   "unifiDoorIds": ["38357452-65f5-4d3e-babc-6e34ce0aa4f7"] },
+    "gym_rear":    { "label": "Gym Rear",    "unifiDoorIds": ["f975beeb-216d-4bbe-9542-78d5b6c2ca2a"] }
+  },
+  "doorGroups": {
+    "lobby_group": { "label": "Lobby Group", "doorKeys": ["front_lobby", "rear_lobby"] },
+    "gym_group":   { "label": "Gym Group",   "doorKeys": ["gym_front", "gym_rear"] },
+    "all_doors":   { "label": "All Doors",   "doorKeys": ["front_lobby", "rear_lobby", "office", "gym_front", "gym_rear"] }
   },
   "rooms": {
     "Sanctuary": ["front_lobby", "rear_lobby"],
-    "Gym": ["gym_front"]
+    "Gym":       ["gym_front", "gym_rear"],
+    "Gymnasium": ["gym_front", "gym_rear"]
   },
   "defaults": {
     "unlockLeadMinutes": 15,
@@ -160,7 +167,8 @@ Current doors configured (in display order):
 }
 ```
 
-- **`doors`**: defines every physical door group. Each key is a slug (`front_lobby`), `unifiDoorIds` is a list of UniFi door UUIDs. **The order of keys determines the display order and color assignment** in the door status card and schedule timeline.
+- **`doors`**: defines every physical door group. Each key is a slug (`front_lobby`), `unifiDoorIds` is a list of UniFi door UUIDs. **The order of keys determines the display order and color assignment** in the door status card and schedule timeline. All configured doors always appear in the door status card, even if they have no scheduled windows.
+- **`doorGroups`**: named groups of door keys used in the Quick Door Access dropdown. Each group has a `label` and a `doorKeys` array. Groups do not affect PCO sync — they are only used for manual access windows. Add, remove, or rename groups freely without any other code changes.
 - **`rooms`**: maps PCO room names (exactly as they appear in PCO resource bookings) to a list of door keys.
 - **`defaults`**: minutes before/after each event to keep doors unlocked.
 - **`rules.excludeDoorKeysByEventName`**: array of rules that prevent specific doors from unlocking for matching events. Matching is case-insensitive substring.
@@ -168,9 +176,9 @@ Current doors configured (in display order):
 
 **Important:** Room names must exactly match what PCO returns in resource booking `name` fields (case-sensitive). If an event has no resource bookings, it falls back to the `location` field.
 
-**Important:** For every door key that will receive office hours windows, a UniFi Access schedule named exactly `PCO Sync {door_key}` (e.g. `PCO Sync office`) **must be pre-created in the UniFi UI**. The sync service will update that schedule's time windows but will NOT auto-create new schedules.
+**Important:** For every door key defined in `doors`, a UniFi Access schedule named exactly `PCO Sync {door_key}` (e.g. `PCO Sync gym_rear`) **must be pre-created in the UniFi UI**. The sync service will update that schedule's time windows but will NOT auto-create new schedules.
 
-**Note:** The `office` door is not mapped to any PCO rooms — it is only used via Office Hours. It still appears in the door status card and schedule timeline.
+**Note:** The `office` door is not mapped to any PCO rooms — it is only used via Office Hours. The `gym_rear` door is mapped to the Gym/Gymnasium rooms and also appears in Quick Door Access groups.
 
 ### `config/office-hours.json`
 
@@ -332,7 +340,7 @@ All pages are served inline as HTML from `py_app/main.py` (no separate template 
 | `GET` | `/api/unifi/doors` | Probe UniFi for full door list |
 | `GET` | `/api/unifi/door-status` | Live lock/position status for all configured door groups |
 | `POST` | `/api/unifi/door/{door_id}/lock` | Send lock command to a specific UniFi door |
-| `GET` | `/api/door-schedule` | Per-door unlock windows (local day + minutes) for the current sync window |
+| `GET` | `/api/door-schedule` | Per-door unlock windows (local day + minutes) for the current sync window. Always returns all configured doors; doors with no windows have an empty `windows` array. |
 | `GET` | `/api/pco/calendars` | List PCO calendars |
 | `GET` | `/api/pco/event-instances/sample` | Raw sample of PCO event_instances |
 
@@ -400,7 +408,8 @@ SyncService.run_once()
 - `_DOOR_COLORS`: module-level list of hex colors assigned to door keys in mapping order — `["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899"]`. Used both server-side (events table door label coloring) and client-side (schedule timeline bars). **The color for a door key is determined by its position in `config/room-door-mapping.json`'s `doors` object.**
 - `_nav(active)`: helper that generates the dark site header HTML with nav links
 - Dashboard page layout: Door Status card → Pending Approvals card → Upcoming Events card → collapsible sections (Sync Details, Recent Errors, PCO API Stats, Sync Configuration, Room→Door Mapping)
-- Dashboard Door Status card: legend showing each door's color square + name + lock status badge (Locked/Unlocked, clickable to lock when unlocked) + position badge (Door Open/Door Closed from sensor). Below the legend: a compact weekly timeline grid (Mon–Sun rows, stacked thin bars per door, alternating row backgrounds). Clicking the grid opens a full modal with larger bars and time labels. Auto-refreshes every `DOOR_STATUS_REFRESH_SECONDS`.
+- Dashboard Door Status card: legend showing each door's color square + name + lock status badge (Locked/Unlocked, clickable to lock when unlocked) + position badge (Door Open/Door Closed from sensor). Below the legend: a compact weekly timeline grid (Mon–Sun rows, stacked thin bars per door, alternating row backgrounds). Clicking the grid opens a full modal with larger bars and time labels. Auto-refreshes every `DOOR_STATUS_REFRESH_SECONDS`. **All configured doors always appear in the legend**, even if they have no scheduled windows — doors with no windows show their live lock status but no timeline bars.
+- Quick Door Access form: dropdown uses `<optgroup>` — "Individual Doors" lists all configured doors, "Door Groups" lists named groups from `doorGroups` in the mapping config. Description field is **mandatory**. The form posts `doorKeys` (array) to `POST /api/manual-access`.
 - Events table: Door Group(s) column renders each door label in its assigned `_DOOR_COLORS` color.
 
 **`py_app/settings.py`**
@@ -471,6 +480,7 @@ PCO Sync front_lobby
 PCO Sync rear_lobby
 PCO Sync office
 PCO Sync gym_front
+PCO Sync gym_rear
 ```
 
 (One per door key defined in `config/room-door-mapping.json`.)
@@ -480,6 +490,8 @@ The service will update the time windows in those schedules but will never creat
 You also do not need to create access policies manually — the service creates/updates a policy named `PCO Sync Policy {door_key}` for each door group automatically.
 
 **Note on the `office` door:** The `office` door is not mapped to any PCO rooms. Its UniFi schedule (`PCO Sync office`) will only receive windows from the Office Hours configuration, not from PCO events. The schedule still needs to exist in UniFi for the sync to succeed when office hours are active for that door.
+
+**Note on the `gym_rear` door:** The `gym_rear` door is mapped to the Gym and Gymnasium PCO rooms (opens alongside Gym Front for those events). It is also available in Quick Door Access as an individual door and as part of the Gym Group and All Doors groups.
 
 ---
 
@@ -543,8 +555,17 @@ The room name must match exactly what PCO returns in resource bookings.
    "new_door_key": { "label": "Human Label", "unifiDoorIds": ["<uuid>"] }
    ```
 3. Create a schedule named `PCO Sync new_door_key` in the UniFi Access UI
-4. Map rooms to it as needed in `"rooms"` (optional — a door can exist just for office hours)
-5. The door will automatically appear in the dashboard door status card and schedule timeline
+4. Map rooms to it as needed in `"rooms"` (optional — a door can exist just for office hours or manual access)
+5. Optionally add it to any `doorGroups` entries (e.g. `all_doors`) in `"doorGroups"`
+6. The door will automatically appear in the dashboard door status card, the Quick Door Access dropdown, and the schedule timeline (once it has windows)
+
+### Adding or editing a Quick Door Access group
+
+Edit `config/room-door-mapping.json` → `"doorGroups"`:
+```json
+"my_group": { "label": "My Group", "doorKeys": ["front_lobby", "rear_lobby"] }
+```
+Groups appear in the Quick Door Access dropdown under "Door Groups". `doorKeys` must reference valid keys in `"doors"`. Changes take effect immediately without a service restart.
 
 ### Changing door display order or colors
 
@@ -605,24 +626,16 @@ These are the highest-value product improvements for making the system easier an
 
 ### 1) Quick Door Access (manual temporary unlock window)
 
-This is the most useful next feature for day-to-day operations.
+**Implemented.** Staff can create a temporary unlock window from the dashboard without touching PCO or office hours.
 
-Add a dashboard workflow that lets a staff member:
-- choose one or more doors from a dropdown
-- choose **start now** or a custom start time
-- choose an end time (required)
-- optionally enter a short reason/note
-- save the temporary window without editing PCO or office hours
-
-Recommended implementation shape:
-- Store these entries in a new file such as `config/manual-access-windows.json`
-- Merge them into the desired schedule the same way office hours are merged
-- Auto-prune expired entries
-- Show active manual windows in a dedicated dashboard card with a clear **Cancel now** action
-- Record `createdAt`, `createdBy` (if auth is added later), and `reason` for auditability
-
-Important constraint:
-- Require an explicit end time. Do not support open-ended unlocks.
+Current implementation:
+- The dropdown shows **Individual Doors** (all 5 configured doors) and **Door Groups** (Lobby Group, Gym Group, All Doors) via `<optgroup>` sections. Groups are defined in `config/room-door-mapping.json` → `doorGroups`.
+- **Description is mandatory** — the form requires a note before submitting (e.g. "Jim Arnold – Wedding"). This is enforced both client-side and server-side.
+- Start Now and +15/+30/+60/+120 min quick-fill buttons are available.
+- Entries stored in `config/manual-access-windows.json`; merged into the door schedule the same way as office hours.
+- Auto-pruned when the end time passes.
+- Create/cancel actions are included in the audit log.
+- The API (`POST /api/manual-access`) accepts a `doorKeys` array (supports multi-door groups). Legacy single `doorKey` is still accepted for backward compatibility.
 
 ### 2) First-run onboarding
 

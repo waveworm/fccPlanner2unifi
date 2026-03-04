@@ -2,7 +2,7 @@
   "enabled": true,
   "schedule": {
     "monday": {
-      "ranges": "9:00-11:00",
+      "ranges": "9:00-11:00,14-16",
       "doors": [
         "front_lobby",
         "office"

@@ -46,3 +46,22 @@ class TelegramClient:
 
     async def notify_sync_error(self, error: str) -> None:
         await self.send(f"❌ PCO→UniFi sync error:\n{error}")
+
+    async def notify_user_action(self, actor: str, message: str) -> None:
+        """Send a notification about a manual user action."""
+        await self.send(f"🔔 {actor}: {message}")
+
+    async def send_test(self) -> str:
+        """Send a test message and return an error string, or empty string on success."""
+        if not self.enabled:
+            return "Telegram is not configured (missing bot token or chat IDs)."
+        url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+        errors = []
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for chat_id in self._chat_ids:
+                try:
+                    resp = await client.post(url, json={"chat_id": chat_id, "text": "✅ PCO→UniFi: Telegram notifications are working."})
+                    resp.raise_for_status()
+                except Exception as exc:
+                    errors.append(f"chat_id {chat_id}: {exc}")
+        return "; ".join(errors) if errors else ""

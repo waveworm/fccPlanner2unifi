@@ -224,11 +224,12 @@ class PcoClient:
                             continue
 
                         raw_location = attrs.get("location")
-                        raw_location_text = str(raw_location or "")
+                        raw_location_text = str(raw_location or "").strip()
                         raw_location_lc = raw_location_text.lower()
 
-                        # Optional early location filter to reduce downstream API calls.
-                        if must_contain and must_contain not in raw_location_lc:
+                        # Only enforce the location substring when PCO provided a non-empty location.
+                        # Many events use resource bookings without populating the top-level location field.
+                        if must_contain and raw_location_text and must_contain not in raw_location_lc:
                             continue
 
                         building = None
