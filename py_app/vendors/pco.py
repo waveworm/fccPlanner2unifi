@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -15,14 +16,17 @@ class PcoClient:
         self.settings = settings
         self._events_cache: dict[tuple[str, str, int], tuple[datetime, list[dict[str, Any]]]] = {}
         self._last_fetch_by_key: dict[tuple[str, str, int], datetime] = {}
+        self._room_names_cache: dict[str, tuple[datetime, list[str]]] = {}
         self._cache_lock = asyncio.Lock()
         self._stats: dict[str, Any] = {
             "cacheHitReturns": 0,
+            "roomCacheHitReturns": 0,
             "minIntervalCacheReturns": 0,
             "liveWindowFetches": 0,
             "eventInstanceRequests": 0,
             "resourceBookingRequests": 0,
             "pco429FallbackReturns": 0,
+            "pco429RetryCount": 0,
             "lastLiveFetchAt": None,
             "lastCacheHitAt": None,
             "last429FallbackAt": None,
@@ -53,21 +57,103 @@ class PcoClient:
             return f"/calendar/v2/calendars/{cal_id}/event_instances"
         return "/calendar/v2/event_instances"
 
+    @staticmethod
+    def _parse_retry_after_seconds(response: httpx.Response, *, default_seconds: float = 1.0) -> float:
+        raw = str(response.headers.get("Retry-After") or "").strip()
+        if not raw:
+            return default_seconds
+        try:
+            return max(float(raw), 0.0)
+        except Exception:
+            pass
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = (dt.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+            return max(delta, 0.0)
+        except Exception:
+            return default_seconds
+
+    async def _get_with_429_retry(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        path: str,
+        params: dict[str, Any] | None = None,
+        attempts: int = 3,
+    ) -> httpx.Response:
+        last_resp: httpx.Response | None = None
+        for idx in range(max(1, attempts)):
+            resp = await client.get(path, headers=self._auth_headers(), params=params)
+            last_resp = resp
+            if resp.status_code != 429:
+                resp.raise_for_status()
+                return resp
+            if idx >= attempts - 1:
+                break
+            wait_s = self._parse_retry_after_seconds(resp, default_seconds=float(2 ** idx))
+            self._stats["pco429RetryCount"] = int(self._stats.get("pco429RetryCount") or 0) + 1
+            await asyncio.sleep(min(wait_s, 20.0))
+        assert last_resp is not None
+        last_resp.raise_for_status()
+        return last_resp
+
+    async def _get_cached_events_fallback(self, cache_key: tuple[str, str, int]) -> list[dict[str, Any]] | None:
+        """Return cached events for exact key, else newest cache with same max_items bucket."""
+        async with self._cache_lock:
+            cached = self._events_cache.get(cache_key)
+            if cached:
+                self._stats["pco429FallbackReturns"] = int(self._stats.get("pco429FallbackReturns") or 0) + 1
+                self._stats["last429FallbackAt"] = datetime.now(timezone.utc).isoformat()
+                return list(cached[1])
+
+            wanted_max_items = int(cache_key[2] or 0)
+            best_ts: datetime | None = None
+            best_items: list[dict[str, Any]] | None = None
+            for key, (cached_at, cached_items) in self._events_cache.items():
+                if int(key[2] or 0) != wanted_max_items:
+                    continue
+                if best_ts is None or cached_at > best_ts:
+                    best_ts = cached_at
+                    best_items = cached_items
+            if best_items is not None:
+                self._stats["pco429FallbackReturns"] = int(self._stats.get("pco429FallbackReturns") or 0) + 1
+                self._stats["last429FallbackAt"] = datetime.now(timezone.utc).isoformat()
+                return list(best_items)
+        return None
+
     async def _get_instance_room_names(self, client: httpx.AsyncClient, instance_id: str) -> list[str]:
         """Return room resource names booked for an event instance.
 
         Uses the documented event_instance resource_bookings link and includes resource objects
         so we can extract room names like 'Gym', 'Sanctuary', etc.
         """
+        now = datetime.now(timezone.utc)
+        # Keep a short in-memory cache to reduce repeated per-instance calls across frequent sync/preview requests.
+        room_cache_ttl_seconds = 15 * 60
+        cached = self._room_names_cache.get(instance_id)
+        if cached:
+            cached_at, cached_rooms = cached
+            if (now - cached_at).total_seconds() <= room_cache_ttl_seconds:
+                self._stats["roomCacheHitReturns"] = int(self._stats.get("roomCacheHitReturns") or 0) + 1
+                return list(cached_rooms)
+
         try:
             self._stats["resourceBookingRequests"] = int(self._stats.get("resourceBookingRequests") or 0) + 1
-            resp = await client.get(
-                f"/calendar/v2/event_instances/{instance_id}/resource_bookings",
-                headers=self._auth_headers(),
+            resp = await self._get_with_429_retry(
+                client,
+                path=f"/calendar/v2/event_instances/{instance_id}/resource_bookings",
                 params={"per_page": 100, "include": "resource"},
             )
-            resp.raise_for_status()
             payload = resp.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 429 and cached:
+                # Return stale room data instead of dropping mapped-room resolution.
+                self._stats["pco429FallbackReturns"] = int(self._stats.get("pco429FallbackReturns") or 0) + 1
+                self._stats["last429FallbackAt"] = datetime.now(timezone.utc).isoformat()
+                return list(cached[1])
+            return []
         except Exception:
             return []
 
@@ -98,6 +184,7 @@ class PcoClient:
             if name and name not in room_names:
                 room_names.append(name)
 
+        self._room_names_cache[instance_id] = (datetime.now(timezone.utc), list(room_names))
         return room_names
 
     def _auth_headers(self) -> dict[str, str]:
@@ -197,12 +284,11 @@ class PcoClient:
                         "where[starts_at][lte]": end_s,
                     }
                     self._stats["eventInstanceRequests"] = int(self._stats.get("eventInstanceRequests") or 0) + 1
-                    resp = await client.get(
-                        self._event_instances_path(),
-                        headers=self._auth_headers(),
+                    resp = await self._get_with_429_retry(
+                        client,
+                        path=self._event_instances_path(),
                         params=params,
                     )
-                    resp.raise_for_status()
                     payload = resp.json()
 
                     data = payload.get("data") or []
@@ -283,12 +369,9 @@ class PcoClient:
                     offset += len(data)
             except httpx.HTTPStatusError as exc:
                 if exc.response is not None and exc.response.status_code == 429:
-                    async with self._cache_lock:
-                        cached = self._events_cache.get(cache_key)
-                        if cached:
-                            self._stats["pco429FallbackReturns"] = int(self._stats.get("pco429FallbackReturns") or 0) + 1
-                            self._stats["last429FallbackAt"] = datetime.now(timezone.utc).isoformat()
-                            return list(cached[1])
+                    fallback = await self._get_cached_events_fallback(cache_key)
+                    if fallback is not None:
+                        return fallback
                 raise
 
         async with self._cache_lock:

@@ -288,12 +288,17 @@ class SyncService:
         mapping_defaults = (mapping.get("defaults") or {})
         lead_min = int(mapping_defaults.get("unlockLeadMinutes") or 15)
         lag_min = int(mapping_defaults.get("unlockLagMinutes") or 15)
-        events, _ = filter_and_flag_events(
+        events, newly_flagged = filter_and_flag_events(
             events, local_tz, lead_min, lag_min,
             self.settings.pending_approvals_file,
             self.settings.approved_event_names_file,
             self.settings.safe_hours_file,
         )
+        # get_preview can be the first code path that discovers after-hours events.
+        # If we only notify in run_once, those events can become "already pending"
+        # before run_once executes, which suppresses the initial alert.
+        if newly_flagged:
+            await self.telegram.notify_flagged_events(newly_flagged)
         events = events[:limit]
         overrides_cfg = load_event_overrides(self.settings.event_overrides_file)
         desired = build_desired_schedule(

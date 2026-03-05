@@ -314,6 +314,247 @@ class UnifiAccessClient:
                 f"Could not lock door {door_id}. Last error: {last_err}"
             )
 
+    async def get_door_policy_bindings(self, door_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return policy/schedule bindings per door id from UniFi Access policies.
+
+        Result shape:
+          {
+            "<door_id>": {
+              "policyNames": [...],
+              "scheduleNames": [...],
+            },
+            ...
+          }
+        """
+        out: dict[str, dict[str, Any]] = {
+            str(d): {"policyNames": [], "scheduleNames": []}
+            for d in door_ids
+            if str(d).strip()
+        }
+        if not out:
+            return out
+
+        did_set = set(out.keys())
+        try:
+            async with httpx.AsyncClient(
+                base_url=str(self.settings.unifi_access_base_url),
+                timeout=20.0,
+                verify=self.settings.unifi_access_verify_tls,
+            ) as client:
+                schedules = await self._list_access_schedules(client)
+                schedule_name_by_id = {
+                    str(s.get("id") or ""): str(s.get("name") or "").strip()
+                    for s in schedules
+                    if s.get("id")
+                }
+                policies = await self._list_access_policies(client)
+
+                policy_sets: dict[str, set[str]] = {did: set() for did in did_set}
+                sched_sets: dict[str, set[str]] = {did: set() for did in did_set}
+
+                for policy in policies:
+                    if not isinstance(policy, dict):
+                        continue
+                    policy_name = str(policy.get("name") or "").strip()
+                    schedule_name = schedule_name_by_id.get(str(policy.get("schedule_id") or ""), "").strip()
+                    resources = policy.get("resources") or []
+                    if not isinstance(resources, list):
+                        continue
+                    for res in resources:
+                        if not isinstance(res, dict):
+                            continue
+                        if str(res.get("type") or "").strip().lower() != "door":
+                            continue
+                        did = str(res.get("id") or "").strip()
+                        if did not in did_set:
+                            continue
+                        if policy_name:
+                            policy_sets[did].add(policy_name)
+                        if schedule_name:
+                            sched_sets[did].add(schedule_name)
+
+                for did in did_set:
+                    out[did] = {
+                        "policyNames": sorted(policy_sets.get(did) or set()),
+                        "scheduleNames": sorted(sched_sets.get(did) or set()),
+                    }
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _extract_unlock_schedule(payload: Any) -> tuple[bool, str, str]:
+        """Best-effort parser for door-level unlock schedule fields."""
+        known = False
+        schedule_id = ""
+        schedule_name = ""
+
+        def _set_id_name(sid: Any, sname: Any) -> None:
+            nonlocal schedule_id, schedule_name
+            sid_s = str(sid or "").strip()
+            sname_s = str(sname or "").strip()
+            if sid_s and not schedule_id:
+                schedule_id = sid_s
+            if sname_s and not schedule_name:
+                schedule_name = sname_s
+
+        def _walk(node: Any, unlock_ctx: bool = False) -> None:
+            nonlocal known
+            if isinstance(node, dict):
+                lowered = {str(k).lower(): k for k in node.keys()}
+                local_unlock_ctx = unlock_ctx
+                if any(("unlock" in lk and "schedule" in lk) for lk in lowered.keys()):
+                    local_unlock_ctx = True
+                    known = True
+                if "enable_unlock_schedule" in lowered or "unlock_schedule_enabled" in lowered:
+                    local_unlock_ctx = True
+                    known = True
+
+                # Common object shapes.
+                for lk, orig in lowered.items():
+                    if lk in ("unlock_schedule", "unlockschedule"):
+                        known = True
+                        value = node.get(orig)
+                        if isinstance(value, dict):
+                            _set_id_name(
+                                value.get("id") or value.get("schedule_id") or value.get("unlock_schedule_id"),
+                                value.get("name") or value.get("schedule_name") or value.get("unlock_schedule_name"),
+                            )
+                        elif isinstance(value, str):
+                            _set_id_name("", value)
+
+                if local_unlock_ctx:
+                    _set_id_name(
+                        node.get("unlock_schedule_id")
+                        or node.get("unlockScheduleId")
+                        or node.get("schedule_id")
+                        or node.get("scheduleId"),
+                        node.get("unlock_schedule_name")
+                        or node.get("unlockScheduleName")
+                        or node.get("schedule_name")
+                        or node.get("scheduleName"),
+                    )
+
+                for lk, orig in lowered.items():
+                    value = node.get(orig)
+                    child_unlock_ctx = local_unlock_ctx or ("unlock" in lk and "schedule" in lk)
+                    _walk(value, child_unlock_ctx)
+                return
+
+            if isinstance(node, list):
+                for item in node:
+                    _walk(item, unlock_ctx)
+
+        _walk(payload, False)
+        return known, schedule_id, schedule_name
+
+    async def get_door_unlock_schedule_bindings(self, door_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return door-level unlock schedule assignment per door id.
+
+        Result shape:
+          {
+            "<door_id>": {
+              "known": bool,                  # endpoint exposes unlock schedule config
+              "unlockScheduleId": str,        # may be empty
+              "unlockScheduleName": str,      # may be empty
+              "source": str,                  # endpoint that provided the value
+            }
+          }
+        """
+        out: dict[str, dict[str, Any]] = {
+            str(d): {
+                "known": False,
+                "unlockScheduleId": "",
+                "unlockScheduleName": "",
+                "source": "unknown",
+            }
+            for d in door_ids
+            if str(d).strip()
+        }
+        if not out:
+            return out
+
+        did_set = set(out.keys())
+        try:
+            async with httpx.AsyncClient(
+                base_url=str(self.settings.unifi_access_base_url),
+                timeout=20.0,
+                verify=self.settings.unifi_access_verify_tls,
+            ) as client:
+                # First pass: some firmware may include unlock schedule directly on door objects.
+                payload = await self._api_get(client, "/api/v1/developer/doors")
+                doors = payload.get("data") or []
+                if isinstance(doors, list):
+                    for row in doors:
+                        if not isinstance(row, dict):
+                            continue
+                        did = str(row.get("id") or "").strip()
+                        if did not in did_set:
+                            continue
+                        known, sid, sname = self._extract_unlock_schedule(row)
+                        if known:
+                            out[did] = {
+                                "known": True,
+                                "unlockScheduleId": sid,
+                                "unlockScheduleName": sname,
+                                "source": "GET /api/v1/developer/doors",
+                            }
+
+                # Second pass: probe per-door endpoints used by some controller versions.
+                per_door_paths = [
+                    ("/api/v1/developer/doors/{did}", False),
+                    ("/api/v1/developer/doors/{did}/settings", False),
+                    ("/api/v1/developer/doors/{did}/setting", False),
+                    ("/api/v1/developer/doors/{did}/config", False),
+                    ("/api/v1/developer/doors/{did}/unlock_schedule", True),
+                    ("/api/v1/developer/doors/{did}/unlock-schedule", True),
+                    ("/api/v1/developer/door_unlock_schedules/{did}", True),
+                    ("/api/v1/developer/door_unlock_schedules?door_id={did}", True),
+                ]
+                for did in did_set:
+                    if bool(out.get(did, {}).get("known")):
+                        continue
+                    for path_tpl, force_unlock_context in per_door_paths:
+                        path = path_tpl.format(did=did)
+                        try:
+                            payload = await self._api_get(client, path)
+                        except Exception:
+                            continue
+                        data = payload.get("data")
+                        if force_unlock_context:
+                            known, sid, sname = self._extract_unlock_schedule({"unlock_schedule": data})
+                        else:
+                            known, sid, sname = self._extract_unlock_schedule(data)
+                        if known:
+                            out[did] = {
+                                "known": True,
+                                "unlockScheduleId": sid,
+                                "unlockScheduleName": sname,
+                                "source": f"GET {path}",
+                            }
+                            break
+
+                # If we have ids but not names, resolve via schedule list.
+                unresolved = [
+                    did for did, row in out.items()
+                    if row.get("known") and row.get("unlockScheduleId") and not row.get("unlockScheduleName")
+                ]
+                if unresolved:
+                    schedules = await self._list_access_schedules(client)
+                    by_id = {
+                        str(row.get("id") or "").strip(): str(row.get("name") or "").strip()
+                        for row in schedules
+                        if isinstance(row, dict) and row.get("id")
+                    }
+                    for did in unresolved:
+                        sid = str(out[did].get("unlockScheduleId") or "").strip()
+                        if sid and by_id.get(sid):
+                            out[did]["unlockScheduleName"] = by_id[sid]
+        except Exception:
+            pass
+
+        return out
+
     async def apply_desired_schedule(self, desired: dict[str, Any]) -> None:
         door_windows = desired.get("doorWindows") or []
         if not isinstance(door_windows, list):

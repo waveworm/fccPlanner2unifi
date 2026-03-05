@@ -1,3 +1,15 @@
 .env
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Operational/state files (change frequently; not source config)
 config/audit-log.jsonl
 config/event-memory.json
+config/manual-access-windows.json
+config/pending-approvals.json
+config/cancelled-events.json
+config/cancelled-office-hours.json
+config/approved-event-names.json
+config/sync-state.json

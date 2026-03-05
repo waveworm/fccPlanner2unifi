@@ -87,7 +87,7 @@ body {
 /* Collapsible sections */
 details.collapsible {
   background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
-  margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04); overflow: hidden;
+  margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04); overflow: visible;
 }
 details.collapsible > summary {
   padding: 14px 20px; cursor: pointer; list-style: none;
@@ -100,6 +100,30 @@ details.collapsible > summary::after { content: '▼'; font-size: 9px; color: #9
 details.collapsible[open] > summary { border-bottom: 1px solid #e2e8f0; }
 details.collapsible[open] > summary::after { content: '▲'; }
 .details-body { padding: 16px 20px; }
+
+/* Inline help tip */
+.help-tip {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:16px; height:16px; border-radius:999px; margin-left:6px;
+  border:1px solid #93c5fd; background:#dbeafe; color:#1e3a8a;
+  font-size:11px; font-weight:800; line-height:1; cursor:help; position:relative;
+  user-select:none; vertical-align:middle;
+}
+.help-tip::before {
+  content:''; position:absolute; left:50%; top:calc(100% + 4px); transform:translateX(-50%);
+  border:6px solid transparent; border-bottom-color:#0f172a; opacity:0; pointer-events:none;
+  transition: opacity .12s ease;
+}
+.help-tip::after {
+  content:attr(data-tip); position:absolute; left:50%; top:calc(100% + 10px); transform:translateX(-50%);
+  width:max-content; min-width:220px; max-width:320px;
+  background:#0f172a; color:#e2e8f0; border-radius:8px; padding:8px 10px;
+  box-shadow:0 12px 30px rgba(2,6,23,.35); font-size:12px; font-weight:500; line-height:1.45;
+  white-space:normal; opacity:0; pointer-events:none; z-index:10020; text-transform:none; letter-spacing:0;
+  transition: opacity .12s ease;
+}
+.help-tip:hover::before, .help-tip:focus-visible::before,
+.help-tip:hover::after, .help-tip:focus-visible::after { opacity:1; }
 
 /* Status dots */
 .dot {
@@ -202,6 +226,8 @@ a:hover { text-decoration: underline; }
   /* Headings */
   .page-heading { font-size: 18px; }
   .stat-grid { grid-template-columns: 1fr 1fr; gap: 12px; }
+  .help-tip::after { min-width: 180px; max-width: min(280px, calc(100vw - 32px)); left:auto; right:0; transform:none; }
+  .help-tip::before { left:auto; right:6px; transform:none; }
 }
 """
 
@@ -507,8 +533,18 @@ def create_app() -> FastAPI:
         color_for_key = {dk: _DOOR_COLORS[i % len(_DOOR_COLORS)] for i, dk in enumerate(all_door_keys)}
         local_tz = ZoneInfo(settings.display_timezone)
         door_map: dict[str, dict] = {}
+        active_names_by_key: dict[str, list[str]] = {}
+        active_count_by_key: dict[str, int] = {}
 
         for w in door_windows:
+            try:
+                start_utc = datetime.fromisoformat(str(w["openStart"]).replace("Z", "+00:00"))
+                end_utc = datetime.fromisoformat(str(w["openEnd"]).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            # Door schedule UI is "current + upcoming"; hide fully-ended windows.
+            if end_utc <= now:
+                continue
             key = w["doorKey"]
             if key not in door_map:
                 door_map[key] = {
@@ -517,8 +553,16 @@ def create_app() -> FastAPI:
                     "color": color_for_key.get(key, _DOOR_COLORS[len(door_map) % len(_DOOR_COLORS)]),
                     "windows": [],
                 }
-            start_utc = datetime.fromisoformat(w["openStart"].replace("Z", "+00:00"))
-            end_utc   = datetime.fromisoformat(w["openEnd"].replace("Z", "+00:00"))
+            try:
+                if start_utc <= now < end_utc:
+                    active_count_by_key[key] = int(active_count_by_key.get(key) or 0) + 1
+                    names = active_names_by_key.setdefault(key, [])
+                    for name in (w.get("sourceEventNames") or []):
+                        n = str(name or "").strip()
+                        if n and n not in names:
+                            names.append(n)
+            except Exception:
+                pass
             cur = start_utc.astimezone(local_tz)
             end_local = end_utc.astimezone(local_tz)
             while cur < end_local:
@@ -575,10 +619,25 @@ def create_app() -> FastAPI:
                     "color": color_for_key.get(dk, _DOOR_COLORS[0]),
                     "windows": [],
                 }
+            names = active_names_by_key.get(dk) or []
+            door_map[dk]["activeNow"] = {
+                "isOpenBySchedule": bool(active_count_by_key.get(dk)),
+                "windowCount": int(active_count_by_key.get(dk) or 0),
+                "events": names,
+            }
+        for dk, row in door_map.items():
+            if "activeNow" in row:
+                continue
+            names = active_names_by_key.get(dk) or []
+            row["activeNow"] = {
+                "isOpenBySchedule": bool(active_count_by_key.get(dk)),
+                "windowCount": int(active_count_by_key.get(dk) or 0),
+                "events": names,
+            }
         # Return in mapping order so colors and display order stay consistent
         ordered = [door_map[dk] for dk in all_door_keys if dk in door_map]
         ordered += [v for dk, v in door_map.items() if dk not in all_door_keys]
-        return {"timezone": settings.display_timezone, "doors": ordered}
+        return {"timezone": settings.display_timezone, "now": now.isoformat(), "doors": ordered}
 
     @app.get("/api/pco/calendars")
     async def api_pco_calendars() -> dict:
@@ -760,12 +819,15 @@ def create_app() -> FastAPI:
             target=str(entry.get("id") or ""),
             note=f"{door_labels} {start_at} -> {end_at} ({note})",
         )
-        await _notify(request, f"Quick Door Access scheduled: {door_labels} — {note} ({start_at} → {end_at})")
         sync_warning = ""
         try:
             await sync_service.run_once()
         except Exception as exc:
             sync_warning = str(exc)
+        notify_msg = f"Quick Door Access set: {door_labels} — {note} ({start_at} → {end_at})"
+        if sync_warning:
+            notify_msg += f" [sync warning: {sync_warning}]"
+        await _notify(request, notify_msg)
         return {"ok": True, "entry": entry, "syncWarning": sync_warning}
 
     @app.post("/api/manual-access/cancel")
@@ -1286,6 +1348,35 @@ def create_app() -> FastAPI:
     </details>"""
 
         err_badge = f'<span class="badge badge-err" style="margin-left:8px">{error_count}</span>' if error_count else ""
+        def _help_tip(text: str) -> str:
+            tip = _esc(text)
+            return (
+                f'<span class="help-tip" tabindex="0" role="note" '
+                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+            )
+
+        help_quick_access = _help_tip(
+            "Temporary unlock window for one door or group without editing PCO. "
+            "Use for one-off needs, then cancel when finished."
+        )
+        help_door_status = _help_tip(
+            "Live lock/sensor state from UniFi plus whether a schedule window is active right now."
+        )
+        help_upcoming = _help_tip(
+            "Events currently mapped to doors. These drive the unlock windows sent to UniFi during sync."
+        )
+        help_sync_details = _help_tip(
+            "Summary of the last sync run, result, mode, and counts."
+        )
+        help_recent_errors = _help_tip(
+            "Most recent sync/API errors to help diagnose issues quickly."
+        )
+        help_pco_stats = _help_tip(
+            "PCO API usage and cache stats for troubleshooting performance/rate limits."
+        )
+        help_room_mapping = _help_tip(
+            "Maps PCO room names to door groups. If a room is unmapped, no doors unlock for that event."
+        )
 
         html_out = f"""<!doctype html>
 <html lang="en">
@@ -1302,6 +1393,28 @@ def create_app() -> FastAPI:
     .quick-access-grid label {{ font-size: 12px; color:#64748b; font-weight:600; display:block; margin-bottom:4px; }}
     .quick-access-grid input, .quick-access-grid select {{ width:100%; }}
     .event-count {{ font-size: 12px; color: #64748b; font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }}
+    .help-tip {{
+      display:inline-flex; align-items:center; justify-content:center;
+      width:16px; height:16px; border-radius:999px; margin-left:6px;
+      border:1px solid #93c5fd; background:#dbeafe; color:#1e3a8a;
+      font-size:11px; font-weight:800; line-height:1; cursor:help; position:relative;
+      user-select:none; vertical-align:middle;
+    }}
+    .help-tip::before {{
+      content:''; position:absolute; left:50%; top:calc(100% + 4px); transform:translateX(-50%);
+      border:6px solid transparent; border-bottom-color:#0f172a; opacity:0; pointer-events:none;
+      transition: opacity .12s ease;
+    }}
+    .help-tip::after {{
+      content:attr(data-tip); position:absolute; left:50%; top:calc(100% + 10px); transform:translateX(-50%);
+      width:max-content; min-width:220px; max-width:320px;
+      background:#0f172a; color:#e2e8f0; border-radius:8px; padding:8px 10px;
+      box-shadow:0 12px 30px rgba(2,6,23,.35); font-size:12px; font-weight:500; line-height:1.45;
+      white-space:normal; opacity:0; pointer-events:none; z-index:10020; text-transform:none; letter-spacing:0;
+      transition: opacity .12s ease;
+    }}
+    .help-tip:hover::before, .help-tip:focus-visible::before,
+    .help-tip:hover::after, .help-tip:focus-visible::after {{ opacity:1; }}
     .show-mob {{ display: none; }}
     @media (max-width: 640px) {{
       .show-mob {{ display: inline; }}
@@ -1311,6 +1424,8 @@ def create_app() -> FastAPI:
       .status-actions button, .status-actions form {{ flex: 1; }}
       .status-actions form button {{ width: 100%; }}
       .event-count {{ display: block; margin: 4px 0 0; }}
+      .help-tip::after {{ min-width: 180px; max-width: min(280px, calc(100vw - 32px)); left:auto; right:0; transform:none; }}
+      .help-tip::before {{ left:auto; right:6px; transform:none; }}
     }}
     .sched-grid {{ width: 100%; }}
     .sched-lbl {{ width: 28px; flex-shrink: 0; font-size: 10px; color: #94a3b8; padding-right: 4px;
@@ -1424,7 +1539,7 @@ def create_app() -> FastAPI:
 
     <details class="collapsible">
       <summary>
-        <span>Quick Door Access</span>
+        <span>Quick Door Access {help_quick_access}</span>
         {f'<span style="margin-left:8px;font-size:12px;font-weight:700;padding:1px 7px;border-radius:10px;background:#dbeafe;color:#1d4ed8;vertical-align:middle">{len(manual_entries)} active</span>' if manual_entries else ""}
       </summary>
       <div class="details-body">
@@ -1483,7 +1598,7 @@ def create_app() -> FastAPI:
     <!-- Door Status -->
     <div class="card" id="doorStatusCard">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:8px;">
-        <span class="card-title" style="margin:0">Door Status</span>
+        <span class="card-title" style="margin:0">Door Status {help_door_status}</span>
         <div style="display:flex;align-items:center;gap:8px;">
           <span id="dsTime" style="font-size:11px;color:#94a3b8"></span>
           <button class="sm" onclick="refreshDoorStatus()" title="Refresh" style="padding:3px 7px;font-size:16px;line-height:1;">↻</button>
@@ -1495,7 +1610,7 @@ def create_app() -> FastAPI:
     <!-- Upcoming Events (always visible) -->
     <div class="card">
       <span class="card-title">
-        Upcoming Events
+        Upcoming Events {help_upcoming}
         <span class="event-count">· {evt_count} event{evt_plural} · {item_count} schedule item{item_plural}</span>
       </span>
       <div style="overflow:auto;">
@@ -1529,7 +1644,7 @@ def create_app() -> FastAPI:
 
     <!-- Sync Details (collapsed) -->
     <details class="collapsible">
-      <summary><span>Sync Details</span></summary>
+      <summary><span>Sync Details {help_sync_details}</span></summary>
       <div class="details-body">
         <div class="stat-grid">
           <div><div class="stat-label">Last Sync</div><div class="stat-val">{last_sync_at}</div></div>
@@ -1544,7 +1659,7 @@ def create_app() -> FastAPI:
 
     <!-- Recent Errors (collapsed) -->
     <details class="collapsible">
-      <summary><span>Recent Errors {err_badge}</span></summary>
+      <summary><span>Recent Errors {help_recent_errors} {err_badge}</span></summary>
       <div class="details-body" style="font-size:13px;line-height:1.7;">
         {recent_errors_html}
       </div>
@@ -1552,7 +1667,7 @@ def create_app() -> FastAPI:
 
     <!-- PCO API Stats (collapsed) -->
     <details class="collapsible">
-      <summary><span>PCO API Stats</span></summary>
+      <summary><span>PCO API Stats {help_pco_stats}</span></summary>
       <div class="details-body">
         <div class="stat-grid">
           {pco_stats_items_html or '<div><div class="stat-val" style="color:#9ca3af">No stats yet.</div></div>'}
@@ -1563,7 +1678,7 @@ def create_app() -> FastAPI:
 
     <!-- Room → Door Mapping (collapsed) -->
     <details class="collapsible">
-      <summary><span>Room → Door Mapping</span></summary>
+      <summary><span>Room → Door Mapping {help_room_mapping}</span></summary>
       <div class="details-body">
         <div style="overflow:auto;">
           <table>
@@ -1912,18 +2027,56 @@ def create_app() -> FastAPI:
       return {{liveByKey, idByKey, positionByKey}};
     }}
 
+    function buildActiveNowMap(schedData) {{
+      const out = {{}};
+      for (const d of (schedData.doors||[])) {{
+        out[d.key] = d.activeNow || {{isOpenBySchedule:false, windowCount:0, events:[]}};
+      }}
+      return out;
+    }}
+
+    function buildDoorReason(live, pos, activeNow) {{
+      const active = activeNow || {{isOpenBySchedule:false, events:[]}};
+      const evtNames = (active.events||[]).map(s => String(s||'').trim()).filter(Boolean);
+      const evtText = evtNames.join(', ');
+
+      if (live === 'UNLOCKED' && active.isOpenBySchedule) {{
+        return evtText
+          ? ('Open by schedule: ' + evtText)
+          : 'Open by schedule right now';
+      }}
+      if (live === 'UNLOCKED' && !active.isOpenBySchedule) {{
+        return 'Unlocked outside this schedule (manual unlock or another UniFi schedule/policy)';
+      }}
+      if (live === 'LOCKED' && active.isOpenBySchedule) {{
+        const prefix = evtText
+          ? ('Scheduled open now for: ' + evtText)
+          : 'Scheduled open now';
+        return prefix + ' (but currently locked). Check UniFi door settings if this persists.';
+      }}
+      if (live === 'LOCKED' && pos === 'OPEN') {{
+        return 'Door is physically open, but lock relay reports locked';
+      }}
+      if (live === 'LOCKED') {{
+        return 'No active schedule window right now';
+      }}
+      return 'Live state unavailable';
+    }}
+
     // Build the legend HTML (used in both card and modal)
-    function buildLegend(doors, liveByKey, idByKey, positionByKey, closeModalOnLock) {{
+    function buildLegend(doors, liveByKey, idByKey, positionByKey, activeNowByKey, closeModalOnLock) {{
       let html = '';
       for (const d of doors) {{
         const live = liveByKey[d.key]||'UNKNOWN';
         const isUnlocked=live==='UNLOCKED', isUnknown=live==='UNKNOWN';
         const doorId=idByKey[d.key];
         const pos=positionByKey[d.key]||'UNKNOWN';
+        const activeNow = activeNowByKey[d.key] || {{isOpenBySchedule:false, events:[]}};
+        const reason = buildDoorReason(live, pos, activeNow);
 
         // Lock/unlock badge
-        const lockBg  = isUnknown?'#f1f5f9':(isUnlocked?'#dcfce7':'#fee2e2');
-        const lockClr = isUnknown?'#64748b':(isUnlocked?'#15803d':'#dc2626');
+        const lockBg  = isUnknown?'#e2e8f0':(isUnlocked?'#dcfce7':'#fee2e2');
+        const lockClr = isUnknown?'#475569':(isUnlocked?'#166534':'#991b1b');
         const lockTxt = isUnknown?'?':(isUnlocked?'Unlocked':'Locked');
         const lockCb = closeModalOnLock?'lockDoor(this);closeSchedModal()':'lockDoor(this)';
         const lockAttrs = (isUnlocked&&doorId)
@@ -1933,15 +2086,20 @@ def create_app() -> FastAPI:
         // Door position badge (physical sensor)
         const posBadge = (pos==='UNKNOWN') ? ''
           : '<span style="font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;background:'
-            +(pos==='OPEN'?'#fef3c7':'#f1f5f9')+';color:'
-            +(pos==='OPEN'?'#92400e':'#475569')+'">'
+            +(pos==='OPEN'?'#fef3c7':'#e2e8f0')+';color:'
+            +(pos==='OPEN'?'#92400e':'#334155')+'">'
             +(pos==='OPEN'?'Door Open':'Door Closed')+'</span>';
 
-        html += '<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">'
+        const reasonEsc = reason.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+        const reasonTitle = reasonEsc.replaceAll('"', '&quot;');
+        html += '<div style="display:flex;align-items:center;gap:5px;min-width:0;margin-bottom:2px;">'
           + '<span style="width:10px;height:10px;border-radius:2px;background:'+d.color+';flex-shrink:0"></span>'
           + '<span style="font-size:12px;font-weight:600;color:#1e293b">'+d.label+'</span>'
           + '<span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;background:'+lockBg+';color:'+lockClr+'"'+lockAttrs+'>'+lockTxt+'</span>'
           + posBadge
+          + '<span title="'+reasonTitle+'" style="font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1">'
+          + reasonEsc
+          + '</span>'
           + '</div>';
       }}
       return html;
@@ -1952,9 +2110,10 @@ def create_app() -> FastAPI:
       const timeEl = document.getElementById('dsTime');
       const doors  = schedData.doors||[];
       const {{liveByKey, idByKey, positionByKey}} = buildLiveMaps(statusData);
+      const activeNowByKey = buildActiveNowMap(schedData);
 
       const legend = '<div style="display:flex;flex-direction:column;gap:5px;margin-bottom:10px">'
-        + buildLegend(doors, liveByKey, idByKey, positionByKey, false) + '</div>';
+        + buildLegend(doors, liveByKey, idByKey, positionByKey, activeNowByKey, false) + '</div>';
 
       const grid = '<div onclick="openSchedModal()" style="cursor:pointer" title="Click for detail">'
         + buildSchedGrid(doors, {{laneH:5, labelH:12, hourStep:4, showLabels:false, altBg:true}})
@@ -1971,6 +2130,7 @@ def create_app() -> FastAPI:
       const {{status: sd, sched: sch}} = _lastSchedData;
       const doors = sch.doors||[];
       const {{liveByKey, idByKey, positionByKey}} = buildLiveMaps(sd);
+      const activeNowByKey = buildActiveNowMap(sch);
 
       let overlay = document.getElementById('schedModalOverlay');
       if (!overlay) {{
@@ -1982,7 +2142,7 @@ def create_app() -> FastAPI:
       }}
 
       const legend = '<div style="display:flex;flex-direction:column;gap:7px;margin-bottom:16px">'
-        + buildLegend(doors, liveByKey, idByKey, positionByKey, true) + '</div>';
+        + buildLegend(doors, liveByKey, idByKey, positionByKey, activeNowByKey, true) + '</div>';
 
       overlay.innerHTML = '<div class="sched-modal">'
         + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
@@ -2338,6 +2498,15 @@ def create_app() -> FastAPI:
         new_row = f'<tr style="background:#f0fdf4">{new_row_cells}</tr>'
 
         door_headers = "".join([f"<th style='text-align:center'>{_esc(str(doors_map[dk].get('label', dk)))}</th>" for dk in door_keys])
+        def _help_tip(text: str) -> str:
+            tip = _esc(text)
+            return (
+                f'<span class="help-tip" tabindex="0" role="note" '
+                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+            )
+        help_assignments = _help_tip(
+            "Each row is a PCO room. Check the door groups that should unlock when that room is used."
+        )
 
         html_out = f"""<!doctype html>
 <html lang="en">
@@ -2355,10 +2524,17 @@ def create_app() -> FastAPI:
     <div id="toast" class="toast"></div>
     <h2 class="page-heading">Room → Door Mapping</h2>
     <p class="page-subtitle-text">Check which doors unlock when an event is scheduled in each room. Changes take effect on the next sync cycle.</p>
+    <div class="card" style="background:#f8fafc;border-color:#cbd5e1;">
+      <span class="card-title">How This Page Works</span>
+      <p style="font-size:13px;color:#475569;margin:0;">
+        1) Find the room row from Planning Center. 2) Check the matching door groups. 3) Save mapping.
+        If a room has no checked doors, events in that room will not unlock any doors.
+      </p>
+    </div>
 
     <form id="mappingForm">
       <div class="card" style="overflow:auto;">
-        <span class="card-title">Room Assignments</span>
+        <span class="card-title">Room Assignments {help_assignments}</span>
         <table>
           <thead>
             <tr>
@@ -2544,6 +2720,18 @@ def create_app() -> FastAPI:
             )
 
         enabled_checked = "checked" if oh_enabled else ""
+        def _help_tip(text: str) -> str:
+            tip = _esc(text)
+            return (
+                f'<span class="help-tip" tabindex="0" role="note" '
+                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+            )
+        help_enabled = _help_tip(
+            "Turns recurring office-hours unlocks on or off without deleting the schedule table."
+        )
+        help_weekly = _help_tip(
+            "For each day, set one or more time ranges and select which door groups unlock in those ranges."
+        )
 
         html_out = f"""<!doctype html>
 <html lang="en">
@@ -2569,12 +2757,19 @@ def create_app() -> FastAPI:
       Planning Center event schedules so doors stay unlocked during office hours regardless of
       whether an event is scheduled.
     </p>
+    <div class="card" style="background:#f8fafc;border-color:#cbd5e1;">
+      <span class="card-title">How This Page Works</span>
+      <p style="font-size:13px;color:#475569;margin:0;">
+        1) Enable Office Hours. 2) Enter day/time ranges. 3) Check doors for each day. 4) Save.
+        These windows are merged with event windows during sync.
+      </p>
+    </div>
 
     <form id="officeHoursForm">
       <div class="card">
         <div class="toggle-row">
           <input type="checkbox" name="enabled" id="enabledToggle" {enabled_checked} />
-          <label for="enabledToggle" class="toggle-label">Enable Office Hours</label>
+          <label for="enabledToggle" class="toggle-label">Enable Office Hours {help_enabled}</label>
         </div>
         <p style="font-size:13px;color:#64748b;margin:8px 0 0;">
           When unchecked, office hours are ignored during sync (your schedule below is preserved).
@@ -2582,7 +2777,7 @@ def create_app() -> FastAPI:
       </div>
 
       <div class="card" style="overflow:auto;">
-        <span class="card-title">Weekly Schedule</span>
+        <span class="card-title">Weekly Schedule {help_weekly}</span>
         <p style="font-size:13px;color:#64748b;margin:0 0 12px;">
           Leave the hours field empty for a day to keep doors closed. Multiple ranges: <code>8:00-12:00, 13:00-17:00</code>
         </p>
@@ -2752,6 +2947,18 @@ def create_app() -> FastAPI:
 
         if not mem_events:
             rows_html = '<tr><td colspan="6" style="padding:16px;color:#9ca3af;text-align:center;">No events recorded yet. Run a sync to populate the list.</td></tr>'
+        def _help_tip(text: str) -> str:
+            tip = _esc(text)
+            return (
+                f'<span class="help-tip" tabindex="0" role="note" '
+                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+            )
+        help_event_list = _help_tip(
+            "Choose an event name and set exact open/close windows by door for that event only."
+        )
+        help_editor = _help_tip(
+            "Checked + times: exact windows. Checked + blank: suppress this door for this event. Unchecked: use global defaults."
+        )
 
         html_out = f"""<!doctype html>
 <html lang="en">
@@ -2791,9 +2998,17 @@ def create_app() -> FastAPI:
       Set exact door open/close times per event name. Times are in <strong>{_esc(settings.display_timezone)}</strong>.
       Overrides replace the global lead/lag times for matched events. Unoverridden doors still use defaults.
     </p>
+    <div class="card" style="background:#f8fafc;border-color:#cbd5e1;">
+      <span class="card-title">How This Page Works</span>
+      <p style="font-size:13px;color:#475569;margin:0;">
+        1) Find an event in the list. 2) Click Set Override/Edit. 3) Configure per-door windows. 4) Save.
+        Overrides apply by event name across future occurrences.
+      </p>
+    </div>
 
     <div style="margin-bottom:16px;">
       <input type="text" id="search" placeholder="Search events…" oninput="filterRows(this.value)" />
+      <span style="margin-left:8px;font-size:13px;color:#64748b;">Event List {help_event_list}</span>
     </div>
 
     <div class="card" style="padding:0;overflow:auto;margin-bottom:0;">
@@ -2815,7 +3030,7 @@ def create_app() -> FastAPI:
     </div>
 
     <div id="editPanel" style="display:none;">
-      <h3>Editing: <span id="editEventName" style="font-style:italic;"></span></h3>
+      <h3>Editing: <span id="editEventName" style="font-style:italic;"></span> {help_editor}</h3>
       <div id="refInfo" style="display:none;"></div>
       <p class="edit-instructions">
         <strong>Checked + times filled</strong> → door opens at those exact times for this event only.<br/>
@@ -3261,6 +3476,16 @@ def create_app() -> FastAPI:
         ss_sun = _sh("safeStartSunday",    "05:00"); se_sun = _sh("safeEndSunday",    "23:00")
         telegram_ok = bool(settings.telegram_bot_token and settings.telegram_chat_ids)
         token_placeholder = "••••••••  (leave blank to keep current)" if settings.telegram_bot_token else ""
+        def _help_tip(text: str) -> str:
+            tip = _esc(text)
+            return (
+                f'<span class="help-tip" tabindex="0" role="note" '
+                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+            )
+        help_door_timing = _help_tip("Global default unlock lead/lag minutes for all events unless overridden.")
+        help_after_hours = _help_tip("Events outside these safe windows are held for manual approval on Dashboard.")
+        help_sync = _help_tip("How often sync runs and key system behavior. Save & Restart is required here.")
+        help_telegram = _help_tip("Configure Telegram bot/chat IDs for alert notifications.")
 
         html_out = f"""<!doctype html>
 <html lang="en">
@@ -3299,11 +3524,18 @@ def create_app() -> FastAPI:
     <div id="toast" class="toast"></div>
     <h2 class="page-heading">Settings</h2>
     <p class="page-subtitle-text">Adjust timing, after-hours policy, sync schedule, and notifications.</p>
+    <div class="card" style="background:#f8fafc;border-color:#cbd5e1;">
+      <span class="card-title">How This Page Works</span>
+      <p style="font-size:13px;color:#475569;margin:0;">
+        The first form saves immediately (timing + approval windows). The second form updates system settings
+        and restarts the service. Use Save for form 1 and Save &amp; Restart for form 2.
+      </p>
+    </div>
 
     <!-- Form 1: door timing + safe hours (instant save, no restart) -->
     <form id="timingForm">
       <div class="card">
-        <span class="card-title">Door Timing</span>
+        <span class="card-title">Door Timing {help_door_timing}</span>
         <p style="font-size:13px;color:#64748b;margin:0 0 16px;">
           How many minutes before and after each event the doors unlock. These are global defaults —
           use <a href="/event-overrides">Event Overrides</a> to set exact clock times for specific events.
@@ -3329,7 +3561,7 @@ def create_app() -> FastAPI:
       </div>
 
       <div class="card">
-        <span class="card-title">After-Hours Approval Policy</span>
+        <span class="card-title">After-Hours Approval Policy {help_after_hours}</span>
         <p style="font-size:13px;color:#64748b;margin:0 0 14px;">
           Any event whose door window (startAt − lead through endAt + lag) falls outside a day's
           safe hours is held for manual approval before being applied to UniFi.
@@ -3377,7 +3609,7 @@ def create_app() -> FastAPI:
     <!-- Form 2: system + telegram (writes .env, restarts service) -->
     <form id="systemForm">
       <div class="card">
-        <span class="card-title">Sync Schedule</span>
+        <span class="card-title">Sync Schedule {help_sync}</span>
         <p style="font-size:13px;color:#64748b;margin:0 0 16px;">
           Controls how often the service polls Planning Center for new or changed events and
           pushes updates to UniFi. Changes here require a service restart (click Save &amp; Restart below).
@@ -3439,7 +3671,7 @@ def create_app() -> FastAPI:
       </div>
 
       <div class="card">
-        <span class="card-title">Telegram Notifications</span>
+        <span class="card-title">Telegram Notifications {help_telegram}</span>
         <p style="font-size:13px;color:#64748b;margin:0 0 16px;">
           When a new event is flagged for after-hours approval, Telegram sends an instant message
           to everyone listed in Chat IDs. Requires a bot created via
