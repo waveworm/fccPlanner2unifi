@@ -151,11 +151,19 @@ button {
   transition: background .15s;
 }
 button:hover { background: #f1f5f9; }
+button:disabled { opacity: .6; cursor: not-allowed; }
 button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
 button.primary:hover { background: #1d4ed8; }
 button.danger { color: #dc2626; border-color: #fca5a5; }
 button.danger:hover { background: #fef2f2; }
 button.sm { padding: 6px 13px; font-size: 13px; }
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+.help-tip:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
 
 /* Tables */
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -1352,7 +1360,7 @@ def create_app() -> FastAPI:
             tip = _esc(text)
             return (
                 f'<span class="help-tip" tabindex="0" role="note" '
-                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+                f'aria-label="{tip}" data-tip="{tip}">?</span>'
             )
 
         help_quick_access = _help_tip(
@@ -2502,7 +2510,7 @@ def create_app() -> FastAPI:
             tip = _esc(text)
             return (
                 f'<span class="help-tip" tabindex="0" role="note" '
-                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+                f'aria-label="{tip}" data-tip="{tip}">?</span>'
             )
         help_assignments = _help_tip(
             "Each row is a PCO room. Check the door groups that should unlock when that room is used."
@@ -2724,7 +2732,7 @@ def create_app() -> FastAPI:
             tip = _esc(text)
             return (
                 f'<span class="help-tip" tabindex="0" role="note" '
-                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+                f'aria-label="{tip}" data-tip="{tip}">?</span>'
             )
         help_enabled = _help_tip(
             "Turns recurring office-hours unlocks on or off without deleting the schedule table."
@@ -2951,7 +2959,7 @@ def create_app() -> FastAPI:
             tip = _esc(text)
             return (
                 f'<span class="help-tip" tabindex="0" role="note" '
-                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+                f'aria-label="{tip}" data-tip="{tip}">?</span>'
             )
         help_event_list = _help_tip(
             "Choose an event name and set exact open/close windows by door for that event only."
@@ -3396,32 +3404,56 @@ def create_app() -> FastAPI:
 
     @app.post("/api/system-settings")
     async def api_system_settings_save(request: Request, payload: dict = Body(...)) -> dict:
-        import asyncio, re as _re
+        import asyncio
         from fastapi.responses import JSONResponse
 
         cron = str(payload.get("syncCron") or "").strip()
-        if cron and not _re.match(r'^[\d\*,\-/]+ [\d\*,\-/]+ [\d\*,\-/]+ [\d\*,\-/]+ [\d\*,\-/]+$', cron):
-            _audit(request, action="system_settings.save", result="error", error="Invalid cron expression")
-            return JSONResponse(status_code=422, content={"ok": False, "error": "Invalid cron expression"})
+        if cron:
+            try:
+                CronTrigger.from_crontab(cron, timezone="UTC")
+            except Exception:
+                _audit(request, action="system_settings.save", result="error", error="Invalid cron expression")
+                return JSONResponse(status_code=422, content={"ok": False, "error": "Invalid cron expression"})
         try:
             lookahead = int(payload.get("lookaheadHours") or 168)
         except (ValueError, TypeError):
             _audit(request, action="system_settings.save", result="error", error="Lookahead must be an integer")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Lookahead must be an integer"})
+        if not (1 <= lookahead <= 720):
+            _audit(request, action="system_settings.save", result="error", error="Lookahead must be between 1 and 720 hours")
+            return JSONResponse(status_code=422, content={"ok": False, "error": "Lookahead must be between 1 and 720 hours"})
         try:
-            door_refresh = max(10, int(payload.get("doorStatusRefreshSeconds") or 30))
+            door_refresh = int(payload.get("doorStatusRefreshSeconds") or 30)
         except (ValueError, TypeError):
             _audit(request, action="system_settings.save", result="error", error="Door status refresh must be an integer")
             return JSONResponse(status_code=422, content={"ok": False, "error": "Door status refresh must be an integer"})
+        if door_refresh != 0 and not (10 <= door_refresh <= 3600):
+            _audit(
+                request,
+                action="system_settings.save",
+                result="error",
+                error="Door status refresh must be 0 or between 10 and 3600 seconds",
+            )
+            return JSONResponse(
+                status_code=422,
+                content={"ok": False, "error": "Door status refresh must be 0 or between 10 and 3600 seconds"},
+            )
 
         updates: dict[str, str] = {}
         if cron:
             updates["SYNC_CRON"] = cron
-        if lookahead:
-            updates["SYNC_LOOKAHEAD_HOURS"] = str(lookahead)
+        updates["SYNC_LOOKAHEAD_HOURS"] = str(lookahead)
         updates["DOOR_STATUS_REFRESH_SECONDS"] = str(door_refresh)
         tz = str(payload.get("timezone") or "").strip()
         if tz:
+            try:
+                ZoneInfo(tz)
+            except Exception:
+                _audit(request, action="system_settings.save", result="error", error="Display timezone must be a valid IANA timezone")
+                return JSONResponse(
+                    status_code=422,
+                    content={"ok": False, "error": "Display timezone must be a valid IANA timezone"},
+                )
             updates["DISPLAY_TIMEZONE"] = tz
         token = str(payload.get("telegramBotToken") or "").strip()
         if token:
@@ -3480,7 +3512,7 @@ def create_app() -> FastAPI:
             tip = _esc(text)
             return (
                 f'<span class="help-tip" tabindex="0" role="note" '
-                f'aria-label="{tip}" title="{tip}" data-tip="{tip}">?</span>'
+                f'aria-label="{tip}" data-tip="{tip}">?</span>'
             )
         help_door_timing = _help_tip("Global default unlock lead/lag minutes for all events unless overridden.")
         help_after_hours = _help_tip("Events outside these safe windows are held for manual approval on Dashboard.")
@@ -3646,7 +3678,7 @@ def create_app() -> FastAPI:
         </p>
         <div class="field-row">
           <label>Door status refresh interval</label>
-          <input type="number" name="doorStatusRefreshSeconds" value="{settings.door_status_refresh_seconds}" min="10" max="3600" />
+          <input type="number" name="doorStatusRefreshSeconds" value="{settings.door_status_refresh_seconds}" min="0" max="3600" />
           <span class="field-hint">seconds</span>
         </div>
         <p class="field-note">
@@ -3725,13 +3757,18 @@ def create_app() -> FastAPI:
 
   </div>
   <script>
+    function parseNumberInput(value, fallback) {{
+      const parsed = Number.parseInt(value, 10);
+      return Number.isNaN(parsed) ? fallback : parsed;
+    }}
+
     document.getElementById("timingForm").addEventListener("submit", async (e) => {{
       e.preventDefault();
       const form = e.target;
       const toast = document.getElementById("toast");
       const payload = {{
-        unlockLeadMinutes:    parseInt(form.unlockLeadMinutes.value) || 15,
-        unlockLagMinutes:     parseInt(form.unlockLagMinutes.value) || 15,
+        unlockLeadMinutes:    parseNumberInput(form.unlockLeadMinutes.value, 15),
+        unlockLagMinutes:     parseNumberInput(form.unlockLagMinutes.value, 15),
         safeStartMonday:      form.safeStartMonday.value,
         safeEndMonday:        form.safeEndMonday.value,
         safeStartTuesday:     form.safeStartTuesday.value,
@@ -3774,9 +3811,9 @@ def create_app() -> FastAPI:
       btn.disabled = true;
       const payload = {{
         syncCron:                   form.syncCron.value.trim(),
-        lookaheadHours:             parseInt(form.lookaheadHours.value) || 168,
+        lookaheadHours:             parseNumberInput(form.lookaheadHours.value, 168),
         timezone:                   form.timezone.value.trim(),
-        doorStatusRefreshSeconds:   parseInt(form.doorStatusRefreshSeconds.value) || 30,
+        doorStatusRefreshSeconds:   parseNumberInput(form.doorStatusRefreshSeconds.value, 30),
         telegramBotToken:           form.telegramBotToken.value,
         telegramChatIds:            form.telegramChatIds.value.trim(),
       }};
