@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -12,6 +12,14 @@ from py_app.settings import Settings
 class UnifiAccessClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+
+    @staticmethod
+    def _raise_for_status_with_body(resp: httpx.Response, method: str, path: str) -> None:
+        if resp.status_code < 400:
+            return
+        body = (resp.text or "").strip()
+        body_snip = body[:500] if body else "(empty body)"
+        raise RuntimeError(f"UniFi {method} {path} failed with HTTP {resp.status_code}: {body_snip}")
 
     def _auth_headers(self) -> dict[str, str]:
         if self.settings.unifi_access_auth_type == "none":
@@ -88,7 +96,7 @@ class UnifiAccessClient:
 
     async def _api_get(self, client: httpx.AsyncClient, path: str) -> dict[str, Any]:
         resp = await client.get(path, headers=self._auth_headers())
-        resp.raise_for_status()
+        self._raise_for_status_with_body(resp, "GET", path)
         payload = resp.json()
         if isinstance(payload, dict) and payload.get("code") not in (None, "SUCCESS"):
             raise RuntimeError(f"UniFi GET {path} failed: {payload.get('code')} {payload.get('msg')}")
@@ -96,7 +104,7 @@ class UnifiAccessClient:
 
     async def _api_post(self, client: httpx.AsyncClient, path: str, body: dict[str, Any]) -> dict[str, Any]:
         resp = await client.post(path, headers=self._auth_headers(), json=body)
-        resp.raise_for_status()
+        self._raise_for_status_with_body(resp, "POST", path)
         payload = resp.json()
         if isinstance(payload, dict) and payload.get("code") not in (None, "SUCCESS"):
             raise RuntimeError(f"UniFi POST {path} failed: {payload.get('code')} {payload.get('msg')}")
@@ -104,7 +112,7 @@ class UnifiAccessClient:
 
     async def _api_put(self, client: httpx.AsyncClient, path: str, body: dict[str, Any]) -> dict[str, Any]:
         resp = await client.put(path, headers=self._auth_headers(), json=body)
-        resp.raise_for_status()
+        self._raise_for_status_with_body(resp, "PUT", path)
         payload = resp.json()
         if isinstance(payload, dict) and payload.get("code") not in (None, "SUCCESS"):
             raise RuntimeError(f"UniFi PUT {path} failed: {payload.get('code')} {payload.get('msg')}")
@@ -112,7 +120,7 @@ class UnifiAccessClient:
 
     async def _api_delete(self, client: httpx.AsyncClient, path: str) -> dict[str, Any]:
         resp = await client.delete(path, headers=self._auth_headers())
-        resp.raise_for_status()
+        self._raise_for_status_with_body(resp, "DELETE", path)
         payload = resp.json()
         if isinstance(payload, dict) and payload.get("code") not in (None, "SUCCESS"):
             raise RuntimeError(f"UniFi DELETE {path} failed: {payload.get('code')} {payload.get('msg')}")
@@ -203,11 +211,24 @@ class UnifiAccessClient:
                 end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00")).astimezone(local_tz)
             except Exception:
                 continue
+            if end_dt <= start_dt:
+                continue
 
-            day = weekday_names[start_dt.weekday()]
-            start_s = start_dt.strftime("%H:%M:%S")
-            end_s = end_dt.strftime("%H:%M:%S")
-            ranges_by_day[day].append((start_s, end_s))
+            segment_start = start_dt
+            while segment_start < end_dt:
+                next_midnight = datetime.combine(
+                    segment_start.date() + timedelta(days=1),
+                    time.min,
+                    tzinfo=local_tz,
+                )
+                segment_end = min(end_dt, next_midnight)
+                day = weekday_names[segment_start.weekday()]
+                start_s = segment_start.strftime("%H:%M:%S")
+                # UniFi day ranges cannot cross midnight, so cap any carryover segment at the
+                # last second of the current day and continue the remainder on the next day.
+                end_s = "23:59:59" if segment_end == next_midnight and segment_end < end_dt else segment_end.strftime("%H:%M:%S")
+                ranges_by_day[day].append((start_s, end_s))
+                segment_start = segment_end
 
         # Merge overlapping intervals per day for clean payloads.
         for day, ranges in ranges_by_day.items():

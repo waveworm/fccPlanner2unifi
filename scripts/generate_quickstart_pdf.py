@@ -37,10 +37,10 @@ def build_pdf() -> None:
     doc = SimpleDocTemplate(
         str(OUT_FILE),
         pagesize=letter,
-        leftMargin=0.65 * inch,
-        rightMargin=0.65 * inch,
-        topMargin=0.6 * inch,
-        bottomMargin=0.6 * inch,
+        leftMargin=0.45 * inch,
+        rightMargin=0.45 * inch,
+        topMargin=0.5 * inch,
+        bottomMargin=0.5 * inch,
         title="FCC Planner to UniFi - Quick Start",
         author="FCC Planner2UniFi",
     )
@@ -86,10 +86,14 @@ def build_pdf() -> None:
     small = ParagraphStyle(
         "Small",
         parent=body,
-        fontSize=9.5,
-        leading=12.5,
+        fontSize=9.25,
+        leading=12,
         textColor=colors.HexColor("#374151"),
     )
+
+    full_width = letter[0] - doc.leftMargin - doc.rightMargin
+    hero_height = 4.25 * inch
+    section_height = 4.45 * inch
 
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     story: list = []
@@ -102,8 +106,15 @@ def build_pdf() -> None:
     story.append(Paragraph("What This Does", h2))
     story.append(
         Paragraph(
-            "This app pulls Planning Center Calendar events, maps event rooms to UniFi Access doors, and builds/updates door unlock windows.",
+            "This app pulls Planning Center Calendar events, maps event rooms to UniFi Access doors, and builds or updates door unlock windows for daily church operations.",
             body,
+        )
+    )
+    story.append(
+        Paragraph(
+            "<b>Important rule:</b> Planning Center remains the source of truth for event scheduling, room changes, and event cancellations. "
+            "This app is the operations layer for doors, approvals, office hours, schedule visibility, and one-off office-hours overrides.",
+            note,
         )
     )
 
@@ -124,11 +135,11 @@ def build_pdf() -> None:
 
     story.append(Paragraph("Quick Start", h2))
     steps = [
-        "Open <b>Dashboard</b> to view upcoming events and scheduled door windows.",
-        "Use <b>Approve/Deny</b> for after-hours events in the Pending Approval card.",
-        "Use <b>Cancel</b> on an event row to remove that event instance from the unlock schedule.",
-        "Use <b>Set Override / Edit Override</b> to set exact door open/close times for a specific event.",
-        "Use <b>Office Hours</b> page to configure recurring office access windows.",
+        "Open <b>Dashboard</b> to confirm the system is healthy, review upcoming events, and see current door status.",
+        "Use <b>Schedule Board</b> for the weekly planning view across church spaces and doors.",
+        "Use <b>Approve / Deny</b> only for after-hours events that need manual review.",
+        "If a specific event needs different door timing, use <b>Event Overrides</b>.",
+        "Use <b>Office Hours</b> for recurring office access and office-hours-only closures or extra open days.",
     ]
     story.append(
         ListFlowable(
@@ -140,8 +151,26 @@ def build_pdf() -> None:
         )
     )
     story.append(Spacer(1, 0.12 * inch))
+    story.append(Paragraph("Recommended Daily Workflow", h2))
+    daily = [
+        "Start on <b>Dashboard</b>: verify sync is healthy and no urgent approvals are waiting.",
+        "Open <b>Schedule Board</b>: review the next 3, 7, or 14 days by area and watch for conflicts.",
+        "Keep all event edits in <b>Planning Center</b>: add, cancel, move, or rename events there.",
+        "Use this app only for access operations: approvals, door timing overrides, manual access, and office-hours management.",
+        "Use <b>Office Hours Calendar Overrides</b> only for front-office closures or extra office-opening windows. They do not cancel Planning Center events.",
+    ]
+    story.append(
+        ListFlowable(
+            [ListItem(Paragraph(s, body), value=i + 1) for i, s in enumerate(daily)],
+            bulletType="1",
+            leftPadding=12,
+            bulletFontName="Helvetica-Bold",
+            bulletFontSize=9,
+        )
+    )
+    story.append(Spacer(1, 0.1 * inch))
     story.append(Paragraph("Dashboard Overview", h2))
-    story.append(_scaled_image(ASSETS / "dashboard.png", max_width=6.15 * inch, max_height=3.5 * inch))
+    story.append(_scaled_image(ASSETS / "dashboard.png", max_width=full_width, max_height=hero_height))
 
     sections = [
         {
@@ -153,6 +182,17 @@ def build_pdf() -> None:
                 "Approve or deny after-hours events in the Pending Approval card.",
                 "Use Cancel to remove a specific event instance from unlock schedules.",
                 "Add temporary/manual access windows when needed for special cases.",
+            ],
+        },
+        {
+            "title": "Schedule Board",
+            "image": ASSETS / "schedule-board.png",
+            "purpose": "Weekly planning view for facilities and operations. It shows upcoming schedule activity by day, by door, and by saved church zone views.",
+            "actions": [
+                "Switch between 3, 7, or 14 days depending on the planning horizon.",
+                "Use saved views like Sanctuary / Lobby, Gym / Student, or Office to narrow what staff see.",
+                "Use the search box to filter by event name, room, or door.",
+                "Watch the warning panels for room conflicts and shared door coverage.",
             ],
         },
         {
@@ -168,11 +208,12 @@ def build_pdf() -> None:
         {
             "title": "Office Hours",
             "image": ASSETS / "office-hours.png",
-            "purpose": "Defines recurring weekly door unlock windows outside event-based scheduling.",
+            "purpose": "Defines recurring weekly office-access windows and office-hours-only calendar overrides.",
             "actions": [
                 "Enable office-hours mode when recurring daily access is needed.",
                 "Set open/close times by day and apply only to the intended doors.",
-                "Use office-hours cancellation controls on Dashboard for one-off closed days.",
+                "Use Office Hours Calendar Overrides for holiday closures, vacation weeks, or extra office-open days.",
+                "Remember: these overrides affect office-hours access only and do not cancel Planning Center events.",
             ],
         },
         {
@@ -197,11 +238,40 @@ def build_pdf() -> None:
         },
     ]
 
+    story.append(PageBreak())
+    story.append(Paragraph("Meeting Summary", h2))
+    summary_points = [
+        "Planning Center stays in charge of events.",
+        "This app stays in charge of doors, approvals, office hours, and operational visibility.",
+        "Schedule Board gives staff a campus-level planning view.",
+        "Office Hours page now includes weekly office hours plus office-hours calendar overrides in one place.",
+        "Office-hours overrides do not cancel or change Planning Center event access windows.",
+    ]
+    story.append(
+        ListFlowable(
+            [ListItem(Paragraph(point, body), value=i + 1) for i, point in enumerate(summary_points)],
+            bulletType="1",
+            leftPadding=12,
+            bulletFontName="Helvetica-Bold",
+            bulletFontSize=9,
+        )
+    )
+    story.append(Spacer(1, 0.12 * inch))
+    story.append(
+        Paragraph(
+            "If someone asks, \"Where should I make this change?\" the answer should usually be simple: "
+            "<b>event change = Planning Center</b>, <b>door behavior / office-hours behavior = this app</b>.",
+            note,
+        )
+    )
+
     for section in sections:
         story.append(PageBreak())
         story.append(Paragraph(section["title"], h2))
         story.append(Paragraph(f"<b>What this page is for:</b> {section['purpose']}", body))
-        story.append(Spacer(1, 0.04 * inch))
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(_scaled_image(section["image"], max_width=full_width, max_height=section_height))
+        story.append(Spacer(1, 0.12 * inch))
         story.append(Paragraph("<b>What users should do here:</b>", body))
         story.append(
             ListFlowable(
@@ -212,8 +282,6 @@ def build_pdf() -> None:
                 bulletFontSize=9,
             )
         )
-        story.append(Spacer(1, 0.08 * inch))
-        story.append(_scaled_image(section["image"], max_width=6.15 * inch, max_height=3.8 * inch))
 
     doc.build(story)
 

@@ -11,6 +11,12 @@ from zoneinfo import ZoneInfo
 
 from py_app.approvals import approve_pending, deny_pending, filter_and_flag_events, load_pending_approvals
 from py_app.event_overrides import load_cancelled_events, load_event_overrides, update_event_memory
+from py_app.exceptions_calendar import (
+    apply_closure_exceptions,
+    apply_office_hours_exceptions_to_instances,
+    build_special_open_windows,
+    list_exception_entries,
+)
 from py_app.manual_access import build_manual_access_windows, list_manual_access
 from py_app.mapping import build_desired_schedule, load_room_door_mapping
 from py_app.office_hours import (
@@ -144,12 +150,31 @@ class SyncService:
             )
 
             oh_config = load_office_hours(self.settings.office_hours_file)
+            cancelled_oh = load_cancelled_office_hours(self.settings.cancelled_office_hours_file)
             oh_windows = build_office_hours_windows(
                 oh_config, from_dt, to_dt,
                 ZoneInfo(self.settings.display_timezone),
                 mapping.get("doors") or {},
+                cancelled_dates=cancelled_oh,
             )
-            desired = merge_office_hours_into_desired(desired, oh_windows)
+            exception_entries = list_exception_entries(self.settings.exception_calendar_file)
+            office_hours_desired = apply_closure_exceptions(
+                {"doorWindows": oh_windows},
+                exception_entries,
+                from_dt=from_dt,
+                to_dt=to_dt,
+                local_tz=local_tz,
+                doors_map=mapping.get("doors") or {},
+            )
+            exception_windows = build_special_open_windows(
+                exception_entries,
+                from_dt=from_dt,
+                to_dt=to_dt,
+                local_tz=local_tz,
+                doors_map=mapping.get("doors") or {},
+            )
+            office_hours_desired = merge_office_hours_into_desired(office_hours_desired, exception_windows)
+            desired = merge_office_hours_into_desired(desired, office_hours_desired.get("doorWindows") or [])
             manual_windows = build_manual_access_windows(
                 list_manual_access(self.manual_access_file),
                 from_dt=from_dt,
@@ -317,7 +342,24 @@ class SyncService:
             mapping.get("doors") or {},
             cancelled_dates=cancelled_oh,
         )
-        desired = merge_office_hours_into_desired(desired, oh_windows)
+        exception_entries = list_exception_entries(self.settings.exception_calendar_file)
+        office_hours_desired = apply_closure_exceptions(
+            {"doorWindows": oh_windows},
+            exception_entries,
+            from_dt=start_dt,
+            to_dt=end_dt,
+            local_tz=local_tz,
+            doors_map=mapping.get("doors") or {},
+        )
+        exception_windows = build_special_open_windows(
+            exception_entries,
+            from_dt=start_dt,
+            to_dt=end_dt,
+            local_tz=local_tz,
+            doors_map=mapping.get("doors") or {},
+        )
+        office_hours_desired = merge_office_hours_into_desired(office_hours_desired, exception_windows)
+        desired = merge_office_hours_into_desired(desired, office_hours_desired.get("doorWindows") or [])
         manual_windows = build_manual_access_windows(
             list_manual_access(self.manual_access_file),
             from_dt=start_dt,
@@ -357,10 +399,18 @@ class SyncService:
 
         # Append office hours instances as synthetic events.
         local_tz = ZoneInfo(self.settings.display_timezone)
+        mapping = load_room_door_mapping(self.settings.room_door_mapping_file)
         oh_config = load_office_hours(self.settings.office_hours_file)
         cancelled_oh = load_cancelled_office_hours(self.settings.cancelled_office_hours_file)
         oh_instances = get_office_hours_instances(
             oh_config, now, end_dt, local_tz, cancelled_dates=cancelled_oh,
+        )
+        exception_entries = list_exception_entries(self.settings.exception_calendar_file)
+        oh_instances = apply_office_hours_exceptions_to_instances(
+            oh_instances,
+            exception_entries,
+            local_tz=local_tz,
+            doors_map=mapping.get("doors") or {},
         )
         # Filter out already-finished office hours instances.
         oh_instances = [

@@ -2,30 +2,40 @@
   "enabled": true,
   "schedule": {
     "monday": {
-      "ranges": "9:00-11:00,14-16",
+      "ranges": "8:30-17:00",
       "doors": [
         "front_lobby",
-        "office"
+        "office",
+        "gym_front"
       ]
     },
     "tuesday": {
-      "ranges": "",
-      "doors": []
-    },
-    "wednesday": {
-      "ranges": "9:00-11:00",
+      "ranges": "8:30-15:00",
       "doors": [
-        "front_lobby",
         "office"
       ]
     },
+    "wednesday": {
+      "ranges": "8:30-17:00",
+      "doors": [
+        "front_lobby",
+        "office",
+        "gym_front"
+      ]
+    },
     "thursday": {
-      "ranges": "",
-      "doors": []
+      "ranges": "8:30-15:00",
+      "doors": [
+        "office"
+      ]
     },
     "friday": {
-      "ranges": "",
-      "doors": []
+      "ranges": "8:30-17:00",
+      "doors": [
+        "front_lobby",
+        "office",
+        "gym_front"
+      ]
     },
     "saturday": {
       "ranges": "",

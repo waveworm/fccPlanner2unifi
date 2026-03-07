@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     event_overrides_file: str = Field(default="./config/event-overrides.json", alias="EVENT_OVERRIDES_FILE")
     event_memory_file: str = Field(default="./config/event-memory.json", alias="EVENT_MEMORY_FILE")
     cancelled_events_file: str = Field(default="./config/cancelled-events.json", alias="CANCELLED_EVENTS_FILE")
+    exception_calendar_file: str = Field(default="./config/exception-calendar.json", alias="EXCEPTION_CALENDAR_FILE")
     cancelled_office_hours_file: str = Field(default="./config/cancelled-office-hours.json", alias="CANCELLED_OFFICE_HOURS_FILE")
     pending_approvals_file: str = Field(default="./config/pending-approvals.json", alias="PENDING_APPROVALS_FILE")
     approved_event_names_file: str = Field(default="./config/approved-event-names.json", alias="APPROVED_EVENT_NAMES_FILE")

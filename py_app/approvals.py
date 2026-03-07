@@ -98,6 +98,16 @@ def _fmt_hhmm(minutes: int) -> str:
     return f"{display}:{m:02d} {period}"
 
 
+def _safe_window_for_day(day_name: str, safe_hours: dict[str, Any]) -> tuple[int, int]:
+    safe_start = _parse_hhmm(
+        safe_hours.get(f"safeStart{day_name}") or safe_hours.get("safeStartTime") or "05:00"
+    )
+    cutoff = _parse_hhmm(
+        safe_hours.get(f"safeEnd{day_name}") or safe_hours.get("safeEndDefault") or "23:00"
+    )
+    return safe_start, cutoff
+
+
 # ── Outside-safe-hours check ────────────────────────────────────────────────
 
 def is_outside_safe_hours(
@@ -113,12 +123,7 @@ def is_outside_safe_hours(
     eff_end = (end_utc + timedelta(minutes=lag_minutes)).astimezone(local_tz)
 
     day_name = _DAY_NAMES[eff_start.weekday()]
-    safe_start = _parse_hhmm(
-        safe_hours.get(f"safeStart{day_name}") or safe_hours.get("safeStartTime") or "05:00"
-    )
-    cutoff = _parse_hhmm(
-        safe_hours.get(f"safeEnd{day_name}") or safe_hours.get("safeEndDefault") or "23:00"
-    )
+    safe_start, cutoff = _safe_window_for_day(day_name, safe_hours)
 
     # Before safe start?
     if _minutes(eff_start) < safe_start:
@@ -137,6 +142,51 @@ def is_outside_safe_hours(
             f"Doors would remain open until {_fmt_hhmm(_minutes(eff_end))}"
             f" (past {_fmt_hhmm(cutoff)} cutoff on {day_name})"
         )
+
+    return False, ""
+
+
+def is_manual_window_outside_safe_hours(
+    start_utc: datetime,
+    end_utc: datetime,
+    local_tz: ZoneInfo,
+    safe_hours: dict[str, Any],
+) -> tuple[bool, str]:
+    """Return (True, reason) if any local-day segment falls outside configured safe hours."""
+    local_start = start_utc.astimezone(local_tz)
+    local_end = end_utc.astimezone(local_tz)
+    current_day = local_start.date()
+    last_day = local_end.date()
+
+    while current_day <= last_day:
+        day_start = datetime(current_day.year, current_day.month, current_day.day, tzinfo=local_tz)
+        next_day = current_day + timedelta(days=1)
+        next_day_start = datetime(next_day.year, next_day.month, next_day.day, tzinfo=local_tz)
+        segment_start = max(local_start, day_start)
+        segment_end = min(local_end, next_day_start)
+        day_name = _DAY_NAMES[day_start.weekday()]
+        safe_start, cutoff = _safe_window_for_day(day_name, safe_hours)
+
+        if _minutes(segment_start) < safe_start:
+            return True, (
+                f"Manual access would begin at {_fmt_hhmm(_minutes(segment_start))}"
+                f" (before {_fmt_hhmm(safe_start)} safe-hours start on {day_name})"
+            )
+
+        segment_end_minutes = _minutes(segment_end)
+        if segment_end == next_day_start and local_end > next_day_start:
+            segment_end_minutes = 24 * 60
+        if segment_end_minutes > cutoff:
+            if segment_end_minutes >= 24 * 60:
+                end_label = "midnight"
+            else:
+                end_label = _fmt_hhmm(segment_end_minutes)
+            return True, (
+                f"Manual access would remain open until {end_label}"
+                f" (past {_fmt_hhmm(cutoff)} cutoff on {day_name})"
+            )
+
+        current_day = next_day
 
     return False, ""
 

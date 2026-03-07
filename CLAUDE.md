@@ -23,6 +23,10 @@ It also supports **Event Time Overrides** — per-event-name rules that replace 
 
 It also supports an **Approval Gate** — events that start outside configured "safe hours" are held in a pending queue and require manual approval before their door schedule is applied. Events by pre-approved names bypass the gate automatically.
 
+It also supports a **Schedule Board** — a 3/7/14-day planning view that combines PCO events, office hours, and manual access windows into a single operator-facing board with per-door timelines plus conflict warnings.
+
+It also supports an **Office Hours Calendar** — a web-managed calendar for office-hours closures and one-off extra office-hours windows. This is intended for holidays, weekday office closures, and one-time front-office access adjustments. Planning Center remains the source of truth for event scheduling and event cancellations.
+
 The service runs as a **systemd service**, exposes a **FastAPI web dashboard** on port 3000, and syncs on a cron schedule (default: every 5 minutes).
 
 ---
@@ -64,6 +68,7 @@ fccplanner2unifi/
 │   ├── event-overrides.json       # Per-event-name door time overrides (managed via /event-overrides UI)
 │   ├── event-memory.json          # Rolling list of known PCO events (auto-updated by sync, never edit)
 │   ├── safe-hours.json            # Per-day safe hours windows for approval gate (managed via /general-settings)
+│   ├── exception-calendar.json    # Office-hours closures + one-off extra-hours windows (managed from /office-hours)
 │   ├── pending-approvals.json     # Queue of events awaiting approval (auto-managed, never edit)
 │   ├── cancelled-events.json      # Events manually cancelled from the dashboard (auto-managed)
 │   ├── manual-access-windows.json # Temporary manual unlock windows (managed from dashboard)
@@ -73,9 +78,15 @@ fccplanner2unifi/
 ├── bin/
 │   ├── run_server.sh              # Dev launcher (activates .venv, runs uvicorn)
 │   └── service.sh                 # Wrapper: install/start/stop/restart/status/logs
+├── scripts/
+│   ├── capture_quickstart_screenshots.py # Refreshes quick-start PNG screenshots from the live app with Playwright
+│   ├── generate_quickstart_docx.py # Builds the editable Google Docs / Word handout from current quick-start content
+│   └── generate_quickstart_pdf.py # Builds the meeting/user handout PDF from docs/quickstart-assets
 ├── tools/
 │   └── mapping_csv_tool.py        # CLI to export/import room-door-mapping.json as CSV
 ├── docs/                          # Supporting docs and CSV templates
+├── FCCPlanner2UniFi-Quick-Start.docx # Generated editable Word handout for Google Docs
+├── FCCPlanner2UniFi-Quick-Start.pdf # Generated operator quick-start handout
 ├── .env                           # Live secrets/config (NOT committed)
 ├── .env.example                   # Template for .env
 ├── requirements.txt               # Python dependencies
@@ -121,6 +132,7 @@ All settings are loaded by `py_app/settings.py` via Pydantic `BaseSettings`. Val
 | `EVENT_OVERRIDES_FILE` | `./config/event-overrides.json` | Path to per-event door time overrides |
 | `EVENT_MEMORY_FILE` | `./config/event-memory.json` | Path to auto-managed event memory (seen events list) |
 | `CANCELLED_EVENTS_FILE` | `./config/cancelled-events.json` | Path to manually cancelled events list |
+| `EXCEPTION_CALENDAR_FILE` | `./config/exception-calendar.json` | Path to exception calendar entries |
 | `PENDING_APPROVALS_FILE` | `./config/pending-approvals.json` | Path to approval queue |
 | `APPROVED_EVENT_NAMES_FILE` | `./config/approved-event-names.json` | Path to pre-approved event name list |
 | `SAFE_HOURS_FILE` | `./config/safe-hours.json` | Path to per-day safe hours config |
@@ -128,6 +140,15 @@ All settings are loaded by `py_app/settings.py` via Pydantic `BaseSettings`. Val
 | `TELEGRAM_BOT_TOKEN` | _(empty)_ | Telegram bot token for approval notifications (optional) |
 | `TELEGRAM_CHAT_IDS` | _(empty)_ | Comma-separated Telegram chat IDs to notify |
 | `DOOR_STATUS_REFRESH_SECONDS` | `30` | How often the dashboard door status card auto-refreshes (0 = disabled) |
+
+Validation enforced by `POST /api/system-settings`:
+- `SYNC_CRON` must parse successfully via APScheduler `CronTrigger.from_crontab(...)`
+- `SYNC_LOOKAHEAD_HOURS` must be between `1` and `720`
+- `DISPLAY_TIMEZONE` must be a valid IANA timezone name (for example `America/New_York`)
+- `DOOR_STATUS_REFRESH_SECONDS` must be `0` or between `10` and `3600`
+
+UI behavior:
+- The General Settings page now preserves literal `0` values for door lead/lag and door-status refresh fields instead of coercing them back to defaults in JavaScript.
 
 ### `config/room-door-mapping.json`
 
@@ -149,6 +170,18 @@ Current doors configured (in display order):
     "gym_group":   { "label": "Gym Group",   "doorKeys": ["gym_front", "gym_rear"] },
     "all_doors":   { "label": "All Doors",   "doorKeys": ["front_lobby", "rear_lobby", "office", "gym_front", "gym_rear"] }
   },
+  "zoneViews": {
+    "sanctuary_lobby": {
+      "label": "Sanctuary / Lobby",
+      "doorKeys": ["front_lobby", "rear_lobby"],
+      "roomNames": ["Sanctuary", "Lobby", "Cafe"]
+    },
+    "gym_student": {
+      "label": "Gym / Student",
+      "doorKeys": ["gym_front", "gym_rear"],
+      "roomNames": ["Gym", "Gymnasium", "Kitchen"]
+    }
+  },
   "rooms": {
     "Sanctuary": ["front_lobby", "rear_lobby"],
     "Gym":       ["gym_front", "gym_rear"],
@@ -169,6 +202,7 @@ Current doors configured (in display order):
 
 - **`doors`**: defines every physical door group. Each key is a slug (`front_lobby`), `unifiDoorIds` is a list of UniFi door UUIDs. **The order of keys determines the display order and color assignment** in the door status card and schedule timeline. All configured doors always appear in the door status card, even if they have no scheduled windows.
 - **`doorGroups`**: named groups of door keys used in the Quick Door Access dropdown. Each group has a `label` and a `doorKeys` array. Groups do not affect PCO sync — they are only used for manual access windows. Add, remove, or rename groups freely without any other code changes.
+- **`zoneViews`**: optional named Schedule Board views. Each view can target a set of `doorKeys`, `roomNames`, or both. These drive the filter pills on `/schedule-board` and let staff switch between campus areas like Sanctuary / Lobby, Gym / Student, or Office without editing code.
 - **`rooms`**: maps PCO room names (exactly as they appear in PCO resource bookings) to a list of door keys.
 - **`defaults`**: minutes before/after each event to keep doors unlocked.
 - **`rules.excludeDoorKeysByEventName`**: array of rules that prevent specific doors from unlocking for matching events. Matching is case-insensitive substring.
@@ -218,6 +252,47 @@ Managed via the `/general-settings` web page. Defines per-day windows during whi
 ```
 
 All times are in `DISPLAY_TIMEZONE`. An event is flagged if its start time falls outside `[safeStart{Day}, safeEnd{Day}]` on the day it occurs.
+
+### `config/exception-calendar.json`
+
+Managed from the `/office-hours` page. Contains operator-created office-hours closures and extra office-hours windows.
+
+```json
+{
+  "entries": [
+    {
+      "id": "abc123",
+      "kind": "closure",
+      "fromDate": "2026-12-24",
+      "toDate": "2026-12-26",
+      "doorKeys": [],
+      "label": "Christmas Office Closed",
+      "note": "Front office closed for holiday week",
+      "startTime": "",
+      "endTime": "",
+      "createdAt": "2026-03-06T01:00:00Z"
+    },
+    {
+      "id": "def456",
+      "kind": "special_open",
+      "fromDate": "2026-12-22",
+      "toDate": "2026-12-24",
+      "doorKeys": ["front_lobby", "rear_lobby"],
+      "label": "Year-End Office Hours",
+      "note": "Front desk open for pickups",
+      "startTime": "09:00",
+      "endTime": "13:00",
+      "createdAt": "2026-03-06T01:05:00Z"
+    }
+  ]
+}
+```
+
+- `fromDate` and `toDate` define an inclusive local-date range. Legacy single-day entries may still have `date`; the app treats that as `fromDate == toDate == date`.
+- `kind: "closure"` removes recurring office-hours unlock windows for the selected doors for each day in the range.
+- `kind: "special_open"` adds the same extra office-hours unlock window for the selected doors on each day in the range.
+- `doorKeys: []` means **all configured doors**.
+- These entries are merged into the actual schedule during both preview and live sync as an **office-hours override layer**. They do not cancel or modify PCO event windows.
 
 ### `config/pending-approvals.json`
 
@@ -304,10 +379,12 @@ All pages are served inline as HTML from `py_app/main.py` (no separate template 
 |---|---|
 | `/` | Redirects to `/dashboard` |
 | `/dashboard` | Main status page: door status card, approval queue, upcoming events, sync controls |
+| `/schedule-board` | 3/7/14-day planning board with saved zone-view filters, free-text search, daily schedule columns, per-door timeline, room conflict warnings, and shared-door coverage warnings |
+| `/exception-calendar` | Compatibility redirect to `/office-hours#office-hours-calendar` |
 | `/settings` | Room → Door mapping editor (checkbox grid) |
-| `/office-hours` | Office hours schedule editor (7 rows × door checkboxes + time range text inputs) |
+| `/office-hours` | Office hours editor with weekly schedule plus embedded Office Hours Calendar overrides |
 | `/event-overrides` | Event time overrides — table of all known events, inline override editor per event |
-| `/general-settings` | Approval gate config: safe hours per day, approved event names, notification settings |
+| `/general-settings` | Door timing, safe hours, sync behavior, timezone, and Telegram notification settings |
 | `/health` | `{"ok": true}` health check |
 
 ### API Endpoints
@@ -319,6 +396,10 @@ All pages are served inline as HTML from `py_app/main.py` (no separate template 
 | `POST` | `/api/config/apply` | Toggle apply mode: `{"applyToUnifi": true}` |
 | `POST` | `/api/sync/run` | Trigger an immediate sync cycle |
 | `GET` | `/api/preview` | Preview what next sync would apply (JSON) |
+| `GET` | `/api/schedule-board` | Structured 3/7/14-day schedule-board data with optional `view` and `q` filters: day buckets, per-door timeline rows, room conflicts, shared door windows |
+| `GET` | `/api/exception-calendar` | Read exception-calendar entries |
+| `POST` | `/api/exception-calendar` | Create an office-hours closure or extra-hours entry and trigger a sync |
+| `POST` | `/api/exception-calendar/delete` | Delete an exception entry and trigger a sync |
 | `GET` | `/api/events/upcoming` | Upcoming events list |
 | `GET` | `/api/events/cancelled` | List of manually cancelled events |
 | `POST` | `/api/events/cancel` | Cancel an event: `{"id", "name", "startAt", "endAt"}` |
@@ -333,9 +414,9 @@ All pages are served inline as HTML from `py_app/main.py` (no separate template 
 | `GET` | `/api/event-overrides` | Read event-overrides config JSON |
 | `POST` | `/api/event-overrides` | Save event-overrides config JSON (validated before write) |
 | `GET` | `/api/event-memory` | Read event-memory JSON (read-only) |
-| `GET` | `/api/general-settings` | Read safe hours + notification settings |
-| `POST` | `/api/general-settings` | Save safe hours + approved event names |
-| `POST` | `/api/system-settings` | Save system-level `.env` settings (port, credentials, etc.) |
+| `GET` | `/api/general-settings` | Read door timing, safe hours, and current system settings used by the Settings page |
+| `POST` | `/api/general-settings` | Save door timing + safe hours |
+| `POST` | `/api/system-settings` | Save validated system-level `.env` settings (cron, lookahead, timezone, door refresh, Telegram) and restart the service |
 | `GET` | `/api/unifi/ping` | Test UniFi connectivity |
 | `GET` | `/api/unifi/doors` | Probe UniFi for full door list |
 | `GET` | `/api/unifi/door-status` | Live lock/position status for all configured door groups |
@@ -385,7 +466,9 @@ SyncService.run_once()
   │         merge overlapping windows per door
   │
   ├─ load_office_hours()               # reads config/office-hours.json
+  ├─ load_cancelled_office_hours()     # reads config/cancelled-office-hours.json
   ├─ build_office_hours_windows()      # generates windows for each date in range
+  ├─ apply exception-calendar entries  # removes/extends office-hours windows only
   ├─ merge_office_hours_into_desired() # combines with PCO windows, re-merges
   │
   └─ [if apply mode]
@@ -408,9 +491,26 @@ SyncService.run_once()
 - `_DOOR_COLORS`: module-level list of hex colors assigned to door keys in mapping order — `["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#ec4899"]`. Used both server-side (events table door label coloring) and client-side (schedule timeline bars). **The color for a door key is determined by its position in `config/room-door-mapping.json`'s `doors` object.**
 - `_nav(active)`: helper that generates the dark site header HTML with nav links
 - Dashboard page layout: Door Status card → Pending Approvals card → Upcoming Events card → collapsible sections (Sync Details, Recent Errors, PCO API Stats, Sync Configuration, Room→Door Mapping)
-- Dashboard Door Status card: legend showing each door's color square + name + lock status badge (Locked/Unlocked, clickable to lock when unlocked) + position badge (Door Open/Door Closed from sensor). Below the legend: a compact weekly timeline grid (Mon–Sun rows, stacked thin bars per door, alternating row backgrounds). Clicking the grid opens a full modal with larger bars and time labels. Auto-refreshes every `DOOR_STATUS_REFRESH_SECONDS`. **All configured doors always appear in the legend**, even if they have no scheduled windows — doors with no windows show their live lock status but no timeline bars.
+- Dashboard Door Status card: legend showing each door's color square + name + lock status badge (Locked/Unlocked, clickable to lock when unlocked) + position badge (Door Open/Door Closed from sensor). Below the legend: a compact weekly timeline grid (Mon–Sun rows, stacked thin bars per door, alternating row backgrounds). Clicking the grid opens a full modal with larger bars and time labels. Auto-refreshes every `DOOR_STATUS_REFRESH_SECONDS`; `0` disables polling but leaves manual refresh available. **All configured doors always appear in the legend**, even if they have no scheduled windows — doors with no windows show their live lock status but no timeline bars.
+- Schedule Board page: server-built planning board with selectable `3`, `7`, or `14` day ranges. It combines PCO events, office-hours instances, manual access windows, and office-hours exception entries into daily columns, then renders a per-door/per-day unlock timeline matrix. It supports:
+  - saved view pills built from `zoneViews`, plus smaller fallback views from `doorGroups`
+  - a free-text `q` filter matching event type, event name, room text, and door labels
+  - JSON export preserving the active `days`, `view`, and `q` filters
+  - two warning buckets:
+  - **Room Conflicts**: overlapping PCO events booked into the same room
+  - **Shared Door Coverage**: a door unlock window driven by multiple events at once (useful for facilities/security review)
+- Office Hours page: server-rendered page with:
+  - recurring weekly office-hours schedule editor
+- Embedded **Office Hours Calendar** section with:
+  - entry form for `Office Closed` and `Extra Office Hours`
+  - rolling 6-week calendar grid
+  - upcoming entries table with delete actions
+  - entries saved to `config/exception-calendar.json`
+  - explicit guidance that Planning Center event changes should still be made in Planning Center
 - Quick Door Access form: dropdown uses `<optgroup>` — "Individual Doors" lists all configured doors, "Door Groups" lists named groups from `doorGroups` in the mapping config. Description field is **mandatory**. The form posts `doorKeys` (array) to `POST /api/manual-access`.
+- Scheduled manual-access rows now support both **Edit** and **Cancel**. Edit reuses the same dashboard form, preloads the saved door group, start/end, and description, and submits to `POST /api/manual-access/update`.
 - Events table: Door Group(s) column renders each door label in its assigned `_DOOR_COLORS` color.
+- Settings forms: the client-side JavaScript now parses numeric fields without using `||` fallbacks, so explicit `0` values are preserved for lead/lag and door-status refresh.
 
 **`py_app/settings.py`**
 - Single `Settings` class using `pydantic_settings.BaseSettings`
@@ -589,7 +689,7 @@ An event is excluded if its `room` field contains any of these strings. Never us
 
 ### Configuring the approval gate
 
-Navigate to `/general-settings`. Set per-day safe hours start and end times. Events starting outside those windows are held in the pending queue on the dashboard. Add event names to the "pre-approved" list to bypass the gate entirely for recurring trusted events.
+Navigate to `/general-settings`. Set per-day safe hours start and end times. Planning Center events starting outside those windows are held in the pending queue on the dashboard. Quick Door Access manual-access windows are not queued, but they do require a second confirmation if the requested access falls outside safe hours. Add event names to the "pre-approved" list to bypass the PCO event gate entirely for recurring trusted events.
 
 ### Adding a pre-approved event name
 
@@ -616,7 +716,7 @@ Edit `config/room-door-mapping.json` → `"defaults"`:
 
 ### Changing the timezone
 
-Set `DISPLAY_TIMEZONE` in `.env`. Restart required.
+Set `DISPLAY_TIMEZONE` in `.env` (or use `/general-settings`). Restart required. The value must be a valid IANA timezone; invalid values are rejected by `POST /api/system-settings` before `.env` is written.
 
 ---
 
@@ -635,9 +735,41 @@ Current implementation:
 - Entries stored in `config/manual-access-windows.json`; merged into the door schedule the same way as office hours.
 - Auto-pruned when the end time passes.
 - Create/cancel actions are included in the audit log.
-- The API (`POST /api/manual-access`) accepts a `doorKeys` array (supports multi-door groups). Legacy single `doorKey` is still accepted for backward compatibility.
+- Existing scheduled windows can be edited in place from the dashboard without canceling and recreating them.
+- If a manual-access window falls outside configured safe hours, the API returns an approval-required response and the dashboard asks the operator to confirm before saving. Confirmed outside-safe-hours saves are annotated in the audit log and notification text.
+- The dashboard mobile layout avoids nested vertical scroll regions where possible so quick-access cards, upcoming events, recent changes, and room-mapping sections scroll with the page instead of trapping touch gestures.
+- On mobile, the non-interactive body of Upcoming Events and Scheduled Manual Access cards intentionally yields pointer events so vertical drag gestures start the page scroll more reliably; the actual action buttons remain clickable.
+- The API supports both creation and editing:
+  - `POST /api/manual-access`
+  - `POST /api/manual-access/update`
+- Both accept a `doorKeys` array (supports multi-door groups). Legacy single `doorKey` is still accepted for backward compatibility. An optional `overrideApproval: true` flag is used by the dashboard after the operator confirms an outside-safe-hours request.
 
-### 2) First-run onboarding
+### 2) Schedule Board
+
+**Implemented.** Staff can review the next `3`, `7`, or `14` days from `/schedule-board`.
+
+Current implementation:
+- Daily columns combine three schedule sources in one place: PCO events, Office Hours, and Manual Access windows.
+- The lower matrix shows one row per door group and one cell per day. Bars reflect the actual unlock windows that will be applied.
+- The board now supports saved zone-view pills driven by `config/room-door-mapping.json` → `zoneViews`. If no custom zone view exists, matching `doorGroups` are also exposed as smaller saved views.
+- A free-text filter box narrows the board by event name, room, or door label while keeping the current day range and selected view.
+- `/api/schedule-board` returns the same structured board data used by the page and accepts `days`, `view`, and `q` query params, which makes filtering/export work straightforward.
+- Conflict review is built in:
+  - room overlap warnings highlight double-booked spaces
+  - shared door coverage warnings highlight doors being kept open by multiple events at once
+
+### 3) First-run onboarding
+
+### 4) Office Hours Calendar
+
+**Implemented.** Staff can add future office-hours closures and extra office-hours windows from the Office Hours page.
+
+Current implementation:
+- Closures remove recurring office-hours unlock windows for the selected doors for each day in the selected date range.
+- Extra office-hours entries add the same one-time window across each day in the selected date range.
+- Entries are stored in `config/exception-calendar.json`.
+- Saving or deleting an entry triggers an immediate sync attempt so the schedule updates quickly.
+- These entries affect office-hours access only. PCO event scheduling and cancellation should still be handled in Planning Center.
 
 New users currently need to understand several separate pages before the system feels safe to use.
 

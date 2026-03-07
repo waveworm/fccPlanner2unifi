@@ -5,11 +5,11 @@
         "gym_front": {
           "windows": [
             {
-              "openTime": "18:40",
+              "openTime": "18:00",
               "closeTime": "19:20"
             },
             {
-              "openTime": "21:15",
+              "openTime": "21:10",
               "closeTime": "21:45"
             }
           ]
@@ -21,14 +21,26 @@
         "front_lobby": {
           "windows": [
             {
-              "openTime": "18:40",
+              "openTime": "17:30",
               "closeTime": "19:20"
             }
           ]
         },
         "rear_lobby": {
-          "windows": []
+          "windows": [
+            {
+              "openTime": "18:45",
+              "closeTime": "19:20"
+            }
+          ]
         },
+        "gym_front": {
+          "windows": []
+        }
+      }
+    },
+    "Sacrifice and Atonement: God's Work of Reconciliation": {
+      "doorOverrides": {
         "gym_front": {
           "windows": []
         }

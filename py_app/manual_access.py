@@ -70,6 +70,38 @@ def cancel_manual_access_entry(file_path: str, entry_id: str) -> dict[str, Any] 
     return removed
 
 
+def update_manual_access_entry(
+    file_path: str,
+    *,
+    entry_id: str,
+    door_keys: list[str],
+    start_at: str,
+    end_at: str,
+    note: str = "",
+) -> dict[str, Any] | None:
+    windows = list_manual_access(file_path)
+    updated: dict[str, Any] | None = None
+    next_windows: list[dict[str, Any]] = []
+    for row in windows:
+        if updated is None and str(row.get("id") or "") == entry_id:
+            updated = {
+                **row,
+                "doorKeys": [str(k).strip() for k in door_keys if str(k).strip()],
+                "startAt": str(start_at).strip(),
+                "endAt": str(end_at).strip(),
+                "note": str(note or "").strip(),
+                "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            next_windows.append(updated)
+            continue
+        next_windows.append(row)
+    if updated is None:
+        return None
+    next_windows.sort(key=lambda row: parse_iso(row.get("startAt")) or datetime.max.replace(tzinfo=timezone.utc))
+    save_manual_access(file_path, {"windows": next_windows})
+    return updated
+
+
 def build_manual_access_windows(
     entries: list[dict[str, Any]],
     *,

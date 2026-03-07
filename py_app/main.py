@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from datetime import timedelta
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 from zoneinfo import ZoneInfo
 
 _esc = html.escape  # shorthand used throughout HTML generation
@@ -25,16 +25,26 @@ from py_app.event_overrides import (
     save_event_overrides,
     validate_event_overrides,
 )
+from py_app.exceptions_calendar import (
+    apply_office_hours_exceptions_to_instances,
+    build_exception_instances,
+    create_exception_entry,
+    delete_exception_entry,
+    list_exception_entries,
+    validate_exception_entry,
+)
 from py_app.manual_access import (
     cancel_manual_access_entry,
     create_manual_access_entry,
     list_manual_access,
+    update_manual_access_entry,
     validate_manual_access_window,
 )
-from py_app.approvals import load_safe_hours, save_safe_hours
+from py_app.approvals import is_manual_window_outside_safe_hours, load_safe_hours, save_safe_hours
 from py_app.logger import get_logger
 from py_app.office_hours import (
     add_cancelled_office_hours_date,
+    get_office_hours_instances,
     load_cancelled_office_hours,
     load_office_hours,
     remove_cancelled_office_hours_date,
@@ -43,6 +53,7 @@ from py_app.office_hours import (
 )
 from py_app.settings import Settings
 from py_app.sync_service import SyncService
+from py_app.utils import parse_iso
 from py_app.vendors.unifi_access import UnifiAccessClient
 from py_app.vendors.pco import PcoClient
 
@@ -55,8 +66,15 @@ body {
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
   margin: 0; background: #f8fafc; color: #1e293b; min-height: 100vh;
   overflow-x: hidden; max-width: 100%;
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y pinch-zoom;
 }
-.page { max-width: 1600px; margin: 0 auto; padding: 24px; }
+.page {
+  max-width: 1600px; margin: 0 auto; padding: 24px; min-width: 0;
+  touch-action: pan-y pinch-zoom;
+}
 
 /* Site header */
 .site-header {
@@ -78,6 +96,7 @@ body {
 .card {
   background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
   padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  min-width: 0; touch-action: pan-y pinch-zoom;
 }
 .card-title {
   font-size: 11px; font-weight: 700; text-transform: uppercase;
@@ -88,6 +107,7 @@ body {
 details.collapsible {
   background: #fff; border: 1px solid #e2e8f0; border-radius: 12px;
   margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04); overflow: visible;
+  touch-action: pan-y pinch-zoom;
 }
 details.collapsible > summary {
   padding: 14px 20px; cursor: pointer; list-style: none;
@@ -99,7 +119,7 @@ details.collapsible > summary::-webkit-details-marker { display: none; }
 details.collapsible > summary::after { content: '▼'; font-size: 9px; color: #94a3b8; }
 details.collapsible[open] > summary { border-bottom: 1px solid #e2e8f0; }
 details.collapsible[open] > summary::after { content: '▲'; }
-.details-body { padding: 16px 20px; }
+.details-body { padding: 16px 20px; touch-action: pan-y pinch-zoom; }
 
 /* Inline help tip */
 .help-tip {
@@ -148,7 +168,7 @@ details.collapsible[open] > summary::after { content: '▲'; }
 button {
   border-radius: 8px; padding: 8px 16px; border: 1px solid #e2e8f0;
   background: #fff; cursor: pointer; font-size: 14px; font-weight: 500;
-  transition: background .15s;
+  transition: background .15s; touch-action: manipulation;
 }
 button:hover { background: #f1f5f9; }
 button:disabled { opacity: .6; cursor: not-allowed; }
@@ -197,6 +217,14 @@ select {
 
 a { color: #2563eb; text-decoration: none; }
 a:hover { text-decoration: underline; }
+.table-wrap {
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  overscroll-behavior-y: auto;
+}
 
 /* Stat grid */
 .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }
@@ -219,16 +247,97 @@ a:hover { text-decoration: underline; }
   .site-nav { width: 100%; flex-wrap: wrap; padding-bottom: 6px; gap: 2px; }
   .site-nav a { font-size: 12px; padding: 4px 8px; }
   /* Cards */
-  .card { padding: 14px 12px; overflow: hidden; }
+  .card { padding: 12px 10px; overflow: visible; }
   .details-body { padding: 14px 12px; }
   details.collapsible > summary { padding: 12px 14px; }
   /* Tables */
   th, td { padding: 6px 7px; font-size: 13px; }
   th { font-size: 11px; }
-  /* Constrain table wrappers so they scroll inside the card, not the page */
-  div[style*="overflow"] { max-width: 100%; }
   /* Hide low-priority columns on small screens */
   .hide-mob { display: none !important; }
+  .show-mob { display: inline !important; }
+  .table-wrap { overflow: visible; }
+  .events-wrap, .manual-wrap { touch-action: pan-y; }
+  .mobile-cards-table, .mobile-cards-table tbody, .mobile-cards-table tr, .mobile-cards-table td {
+    display: block;
+    width: 100%;
+  }
+  .mobile-cards-table thead { display: none; }
+  .mobile-cards-table tbody tr {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    padding: 9px 10px;
+    margin-bottom: 8px;
+    box-shadow: 0 1px 2px rgba(15,23,42,.04);
+    touch-action: pan-y;
+  }
+  .mobile-cards-table tbody tr:last-child { margin-bottom: 0; }
+  .mobile-cards-table td {
+    border-bottom: none;
+    padding: 0;
+    margin-bottom: 7px;
+    white-space: normal !important;
+    touch-action: pan-y;
+  }
+  .mobile-cards-table td:last-child { margin-bottom: 0; }
+  .mobile-cards-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #94a3b8;
+    margin-bottom: 2px;
+  }
+  .mobile-cards-table .actions-cell {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .mobile-cards-table .hide-mob { display: none !important; }
+  .mobile-cards-table .actions-cell button {
+    width: auto;
+    flex: 0 1 auto;
+    margin: 0 !important;
+  }
+  .mobile-cards-table .event-name-cell strong {
+    display: inline-block;
+    font-size: 14px;
+    line-height: 1.25;
+    color: #0f172a;
+  }
+  .mobile-cards-table .time-cell { color: #334155; font-size: 12px; }
+  .mobile-cards-table .meta-cell { color: #475569; font-size: 12px; line-height: 1.35; }
+  .mobile-cards-table .event-name-cell > div,
+  .mobile-cards-table .event-name-cell > span,
+  .mobile-cards-table .event-name-cell br { max-width: 100%; }
+  .events-table,
+  .manual-table,
+  .events-table tbody tr,
+  .events-table tbody,
+  .events-table td,
+  .manual-table tbody tr,
+  .manual-table tbody,
+  .manual-table td {
+    pointer-events: none;
+  }
+  .events-table button,
+  .events-table a,
+  .manual-table button,
+  .manual-table a {
+    pointer-events: auto;
+  }
+  .events-table .actions-cell br,
+  .manual-table .actions-cell br { display: none; }
+  .events-table .actions-cell button,
+  .manual-table .actions-cell button { padding: 5px 10px; font-size: 12px; }
+  .events-table td[data-label="Event"]::before,
+  .manual-table td[data-label="Description"]::before { margin-bottom: 1px; }
   /* Toast — anchor to bottom so it doesn't overlap content */
   .toast { top: auto; bottom: 16px; left: 12px; right: 12px; text-align: center; }
   /* Headings */
@@ -345,6 +454,7 @@ def create_app() -> FastAPI:
     audit_log_file = str(config_dir / "audit-log.jsonl")
     tailscale_peers_file = str(config_dir / "tailscale-peers.json")
     manual_access_file = str(config_dir / "manual-access-windows.json")
+    exception_calendar_file = settings.exception_calendar_file
     ensure_tailscale_peer_map(tailscale_peers_file)
 
     scheduler = AsyncIOScheduler(timezone="UTC")
@@ -378,10 +488,546 @@ def create_app() -> FastAPI:
         display = actor.get("displayName") or actor.get("requestIp") or "Someone"
         await sync_service.telegram.notify_user_action(display, message)
 
+    def _manual_access_approval_reason(start_at: str, end_at: str) -> str:
+        start_dt = parse_iso(start_at)
+        end_dt = parse_iso(end_at)
+        if start_dt is None or end_dt is None:
+            return ""
+        safe_hours = load_safe_hours(settings.safe_hours_file)
+        local_tz = ZoneInfo(settings.display_timezone)
+        outside, reason = is_manual_window_outside_safe_hours(
+            start_dt,
+            end_dt,
+            local_tz,
+            safe_hours,
+        )
+        return reason if outside else ""
+
+    def _event_room_candidates_local(event: dict) -> list[str]:
+        rooms: list[str] = []
+        evt_rooms = event.get("rooms")
+        if isinstance(evt_rooms, list):
+            for room in evt_rooms:
+                room_text = str(room or "").strip()
+                if room_text:
+                    rooms.append(room_text)
+        if not rooms:
+            room_text = str(event.get("room") or "").strip()
+            if room_text:
+                rooms.append(room_text)
+        return list(dict.fromkeys(rooms))
+
+    def _local_day_range(days: int) -> tuple[datetime, datetime, ZoneInfo]:
+        local_tz = ZoneInfo(settings.display_timezone)
+        now = datetime.now(timezone.utc)
+        start_local = now.astimezone(local_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_local = start_local + timedelta(days=days)
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), local_tz
+
+    def _build_schedule_views(mapping: dict) -> list[dict[str, Any]]:
+        doors_cfg = mapping.get("doors") or {}
+        all_door_keys = [str(k) for k in doors_cfg.keys()]
+        all_door_set = set(all_door_keys)
+        views: list[dict[str, Any]] = [{
+            "key": "all",
+            "label": "All Church",
+            "doorKeys": all_door_keys,
+            "roomNames": [],
+            "source": "built_in",
+        }]
+        seen_keys = {"all"}
+
+        zone_views_cfg = mapping.get("zoneViews") or {}
+        if isinstance(zone_views_cfg, dict):
+            for key, raw in zone_views_cfg.items():
+                if key in seen_keys or not isinstance(raw, dict):
+                    continue
+                door_keys = [str(k).strip() for k in (raw.get("doorKeys") or []) if str(k).strip() in all_door_set]
+                room_names = [str(r).strip() for r in (raw.get("roomNames") or []) if str(r).strip()]
+                if not door_keys and not room_names:
+                    continue
+                views.append({
+                    "key": str(key),
+                    "label": str(raw.get("label") or key),
+                    "doorKeys": door_keys or all_door_keys,
+                    "roomNames": room_names,
+                    "source": "zone_view",
+                })
+                seen_keys.add(str(key))
+
+        door_groups_cfg = mapping.get("doorGroups") or {}
+        if isinstance(door_groups_cfg, dict):
+            for key, raw in door_groups_cfg.items():
+                if key in seen_keys or not isinstance(raw, dict):
+                    continue
+                door_keys = [str(k).strip() for k in (raw.get("doorKeys") or []) if str(k).strip() in all_door_set]
+                if not door_keys or set(door_keys) == all_door_set:
+                    continue
+                views.append({
+                    "key": str(key),
+                    "label": str(raw.get("label") or key),
+                    "doorKeys": door_keys,
+                    "roomNames": [],
+                    "source": "door_group",
+                })
+                seen_keys.add(str(key))
+
+        return views
+
+    def _pick_schedule_view(mapping: dict, view_key: str | None) -> dict[str, Any]:
+        views = _build_schedule_views(mapping)
+        selected = next((view for view in views if view["key"] == str(view_key or "").strip()), None)
+        return selected or views[0]
+
+    def _board_event_matches_view(
+        *,
+        door_keys: list[str],
+        room_names: list[str],
+        selected_view: dict[str, Any],
+    ) -> bool:
+        view_door_keys = set(selected_view.get("doorKeys") or [])
+        view_room_names = {str(name).strip() for name in (selected_view.get("roomNames") or []) if str(name).strip()}
+        if not view_door_keys and not view_room_names:
+            return True
+        if view_door_keys.intersection({str(key).strip() for key in door_keys if str(key).strip()}):
+            return True
+        if view_room_names.intersection({str(name).strip() for name in room_names if str(name).strip()}):
+            return True
+        return False
+
+    def _board_event_matches_query(event: dict[str, Any], query: str) -> bool:
+        if not query:
+            return True
+        haystack = " ".join([
+            str(event.get("typeLabel") or ""),
+            str(event.get("name") or ""),
+            str(event.get("roomText") or ""),
+            " ".join(str(label) for label in (event.get("doorLabels") or [])),
+        ]).lower()
+        return query in haystack
+
+    async def _build_schedule_board(days: int, *, view_key: str = "all", query: str = "") -> dict:
+        days = max(1, min(int(days), 14))
+        start_dt, end_dt, local_tz = _local_day_range(days)
+        now = datetime.now(timezone.utc)
+        preview_limit = max(250, days * 80)
+        preview = await sync_service.get_preview(start_dt=start_dt, end_dt=end_dt, limit=preview_limit)
+        mapping = _read_mapping()
+        selected_view = _pick_schedule_view(mapping, view_key)
+        raw_query = str(query or "").strip()
+        query = raw_query.lower()
+        doors_cfg = mapping.get("doors") or {}
+        door_keys = list(doors_cfg.keys())
+        door_color_map = {dk: _DOOR_COLORS[i % len(_DOOR_COLORS)] for i, dk in enumerate(door_keys)}
+        selected_door_keys = [dk for dk in (selected_view.get("doorKeys") or []) if dk in doors_cfg]
+        selected_door_key_set = set(selected_door_keys)
+
+        event_doors: dict[str, list[str]] = {}
+        for item in (preview.get("schedule") or {}).get("items") or []:
+            event_id = str(item.get("sourceEventId") or "").strip()
+            door_key = str(item.get("doorKey") or "").strip()
+            if not event_id or not door_key:
+                continue
+            event_doors.setdefault(event_id, [])
+            if door_key not in event_doors[event_id]:
+                event_doors[event_id].append(door_key)
+
+        day_rows: list[dict] = []
+        day_lookup: dict[str, dict] = {}
+        cursor = start_dt.astimezone(local_tz)
+        for _ in range(days):
+            date_iso = cursor.date().isoformat()
+            row = {
+                "date": date_iso,
+                "label": cursor.strftime("%a %-m/%-d"),
+                "longLabel": cursor.strftime("%A, %b %-d"),
+                "isToday": cursor.date() == now.astimezone(local_tz).date(),
+                "events": [],
+            }
+            day_rows.append(row)
+            day_lookup[date_iso] = row
+            cursor += timedelta(days=1)
+
+        board_events: list[dict] = []
+        for event in preview.get("events") or []:
+            event_id = str(event.get("id") or "")
+            start_iso = str(event.get("startAt") or "")
+            end_iso = str(event.get("endAt") or "")
+            start_local = parse_iso(start_iso)
+            end_local = parse_iso(end_iso)
+            if not start_local or not end_local:
+                continue
+            start_local = start_local.astimezone(local_tz)
+            end_local = end_local.astimezone(local_tz)
+            date_key = start_local.date().isoformat()
+            if date_key not in day_lookup:
+                continue
+            room_names = _event_room_candidates_local(event)
+            event_door_keys = list(event_doors.get(event_id, []))
+            if not _board_event_matches_view(
+                door_keys=event_door_keys,
+                room_names=room_names,
+                selected_view=selected_view,
+            ):
+                continue
+            display_door_keys = [
+                dk for dk in event_door_keys
+                if not selected_door_key_set or dk in selected_door_key_set
+            ] or event_door_keys
+            door_labels = [
+                str((doors_cfg.get(dk) or {}).get("label") or dk)
+                for dk in display_door_keys
+            ]
+            board_event = {
+                "id": event_id,
+                "type": "event",
+                "typeLabel": "PCO Event",
+                "name": str(event.get("name") or ""),
+                "startAt": start_iso,
+                "endAt": end_iso,
+                "startLabel": start_local.strftime("%-I:%M %p"),
+                "endLabel": end_local.strftime("%-I:%M %p"),
+                "roomText": ", ".join(room_names) or "No room",
+                "doorLabels": [label for label in door_labels if label],
+                "doorKeys": display_door_keys,
+                "sortKey": start_iso,
+            }
+            if not _board_event_matches_query(board_event, query):
+                continue
+            board_events.append(board_event)
+            day_lookup[date_key]["events"].append(board_event)
+
+        exception_entries = list_exception_entries(settings.exception_calendar_file)
+        office_hours_cfg = load_office_hours(settings.office_hours_file)
+        cancelled_oh = load_cancelled_office_hours(settings.cancelled_office_hours_file)
+        office_events = get_office_hours_instances(
+            office_hours_cfg,
+            start_dt,
+            end_dt,
+            local_tz,
+            cancelled_dates=cancelled_oh,
+        )
+        office_events = apply_office_hours_exceptions_to_instances(
+            office_events,
+            exception_entries,
+            local_tz=local_tz,
+            doors_map=doors_cfg,
+        )
+        for event in office_events:
+            start_iso = str(event.get("startAt") or "")
+            end_iso = str(event.get("endAt") or "")
+            start_local = parse_iso(start_iso)
+            end_local = parse_iso(end_iso)
+            if not start_local or not end_local:
+                continue
+            start_local = start_local.astimezone(local_tz)
+            end_local = end_local.astimezone(local_tz)
+            date_key = start_local.date().isoformat()
+            if date_key not in day_lookup:
+                continue
+            door_keys_for_event = [str(dk) for dk in (event.get("doors") or []) if str(dk)]
+            if not _board_event_matches_view(
+                door_keys=door_keys_for_event,
+                room_names=[],
+                selected_view=selected_view,
+            ):
+                continue
+            display_door_keys = [
+                dk for dk in door_keys_for_event
+                if not selected_door_key_set or dk in selected_door_key_set
+            ] or door_keys_for_event
+            board_event = {
+                "id": str(event.get("id") or ""),
+                "type": "office_hours",
+                "typeLabel": "Office Hours",
+                "name": "Office Hours",
+                "startAt": start_iso,
+                "endAt": end_iso,
+                "startLabel": start_local.strftime("%-I:%M %p"),
+                "endLabel": end_local.strftime("%-I:%M %p"),
+                "roomText": str(event.get("timeRanges") or "Recurring schedule"),
+                "doorLabels": [
+                    str((doors_cfg.get(dk) or {}).get("label") or dk)
+                    for dk in display_door_keys
+                ],
+                "doorKeys": display_door_keys,
+                "sortKey": start_iso,
+            }
+            if not _board_event_matches_query(board_event, query):
+                continue
+            board_events.append(board_event)
+            day_lookup[date_key]["events"].append(board_event)
+
+        for entry in list_manual_access(manual_access_file):
+            start_dt_entry = parse_iso(entry.get("startAt"))
+            end_dt_entry = parse_iso(entry.get("endAt"))
+            if not start_dt_entry or not end_dt_entry:
+                continue
+            if end_dt_entry <= start_dt or start_dt_entry >= end_dt:
+                continue
+            start_local = start_dt_entry.astimezone(local_tz)
+            end_local = end_dt_entry.astimezone(local_tz)
+            date_key = start_local.date().isoformat()
+            if date_key not in day_lookup:
+                continue
+            entry_door_keys = [str(dk).strip() for dk in (entry.get("doorKeys") or []) if str(dk).strip()]
+            if not _board_event_matches_view(
+                door_keys=entry_door_keys or door_keys,
+                room_names=[],
+                selected_view=selected_view,
+            ):
+                continue
+            display_door_keys = [
+                dk for dk in entry_door_keys
+                if not selected_door_key_set or dk in selected_door_key_set
+            ] or entry_door_keys
+            note_text = str(entry.get("note") or "").strip()
+            board_event = {
+                "id": f"manual-{str(entry.get('id') or '')}",
+                "type": "manual_access",
+                "typeLabel": "Manual Access",
+                "name": note_text or "Manual Access",
+                "startAt": str(entry.get("startAt") or ""),
+                "endAt": str(entry.get("endAt") or ""),
+                "startLabel": start_local.strftime("%-I:%M %p"),
+                "endLabel": end_local.strftime("%-I:%M %p"),
+                "roomText": "Temporary door access",
+                "doorLabels": [
+                    str((doors_cfg.get(dk) or {}).get("label") or dk)
+                    for dk in display_door_keys
+                ],
+                "doorKeys": display_door_keys,
+                "sortKey": str(entry.get("startAt") or ""),
+            }
+            if not _board_event_matches_query(board_event, query):
+                continue
+            board_events.append(board_event)
+            day_lookup[date_key]["events"].append(board_event)
+
+        for event in build_exception_instances(
+            exception_entries,
+            from_dt=start_dt,
+            to_dt=end_dt,
+            local_tz=local_tz,
+            doors_map=doors_cfg,
+        ):
+            start_iso = str(event.get("startAt") or "")
+            end_iso = str(event.get("endAt") or "")
+            start_local = parse_iso(start_iso)
+            end_local = parse_iso(end_iso)
+            if not start_local or not end_local:
+                continue
+            start_local = start_local.astimezone(local_tz)
+            end_local = end_local.astimezone(local_tz)
+            date_key = start_local.date().isoformat()
+            if date_key not in day_lookup:
+                continue
+            event_type = str(event.get("type") or "")
+            event_door_keys = [str(dk) for dk in (event.get("doors") or []) if str(dk)]
+            if not _board_event_matches_view(
+                door_keys=event_door_keys or door_keys,
+                room_names=[],
+                selected_view=selected_view,
+            ):
+                continue
+            display_door_keys = [
+                dk for dk in event_door_keys
+                if not selected_door_key_set or dk in selected_door_key_set
+            ] or event_door_keys
+            board_event = {
+                "id": str(event.get("id") or ""),
+                "type": event_type,
+                "typeLabel": "Office Closed" if event_type == "exception_closure" else "Extra Office Hours",
+                "name": str(event.get("name") or ""),
+                "startAt": start_iso,
+                "endAt": end_iso,
+                "startLabel": start_local.strftime("%-I:%M %p"),
+                "endLabel": end_local.strftime("%-I:%M %p"),
+                "roomText": str(event.get("note") or ("Office hours closed for this date" if event_type == "exception_closure" else "One-time office-hours window")),
+                "doorLabels": [
+                    str((doors_cfg.get(dk) or {}).get("label") or dk)
+                    for dk in display_door_keys
+                ],
+                "doorKeys": display_door_keys,
+                "sortKey": start_iso,
+            }
+            if not _board_event_matches_query(board_event, query):
+                continue
+            board_events.append(board_event)
+            day_lookup[date_key]["events"].append(board_event)
+
+        for row in day_rows:
+            row["events"].sort(key=lambda item: (item.get("sortKey") or "", item.get("name") or ""))
+
+        visible_pco_event_ids = {
+            str(item.get("id") or "")
+            for item in board_events
+            if item.get("type") == "event" and str(item.get("id") or "")
+        }
+
+        room_conflicts: list[dict] = []
+        seen_room_conflicts: set[tuple[str, str, str]] = set()
+        room_events: dict[str, list[dict]] = {}
+        for event in preview.get("events") or []:
+            start_dt_event = parse_iso(event.get("startAt"))
+            end_dt_event = parse_iso(event.get("endAt"))
+            event_id = str(event.get("id") or "")
+            if not start_dt_event or not end_dt_event or not event_id:
+                continue
+            if event_id not in visible_pco_event_ids:
+                continue
+            for room_name in _event_room_candidates_local(event):
+                room_events.setdefault(room_name, []).append({
+                    "id": event_id,
+                    "name": str(event.get("name") or ""),
+                    "start": start_dt_event,
+                    "end": end_dt_event,
+                })
+        for room_name, entries in room_events.items():
+            entries.sort(key=lambda item: item["start"])
+            active: list[dict] = []
+            for current in entries:
+                active = [item for item in active if item["end"] > current["start"]]
+                for previous in active:
+                    key = tuple(sorted([previous["id"], current["id"]]) + [room_name])
+                    if key in seen_room_conflicts:
+                        continue
+                    seen_room_conflicts.add(key)
+                    overlap_start = max(previous["start"], current["start"]).astimezone(local_tz)
+                    overlap_end = min(previous["end"], current["end"]).astimezone(local_tz)
+                    room_conflicts.append({
+                        "room": room_name,
+                        "firstEvent": previous["name"],
+                        "secondEvent": current["name"],
+                        "startLabel": overlap_start.strftime("%a %-m/%-d %-I:%M %p"),
+                        "endLabel": overlap_end.strftime("%-I:%M %p"),
+                    })
+                active.append(current)
+        room_conflicts.sort(key=lambda item: (item["startLabel"], item["room"]))
+
+        shared_door_windows: list[dict] = []
+        for window in (preview.get("schedule") or {}).get("doorWindows") or []:
+            door_key = str(window.get("doorKey") or "")
+            if selected_door_key_set and door_key not in selected_door_key_set:
+                continue
+            names = [str(name or "").strip() for name in (window.get("sourceEventNames") or []) if str(name or "").strip()]
+            unique_names = list(dict.fromkeys(names))
+            if len(unique_names) < 2:
+                continue
+            start_local = parse_iso(window.get("openStart"))
+            end_local = parse_iso(window.get("openEnd"))
+            if not start_local or not end_local:
+                continue
+            start_local = start_local.astimezone(local_tz)
+            end_local = end_local.astimezone(local_tz)
+            shared_door_windows.append({
+                "doorKey": door_key,
+                "doorLabel": str(window.get("doorLabel") or window.get("doorKey") or ""),
+                "startLabel": start_local.strftime("%a %-m/%-d %-I:%M %p"),
+                "endLabel": end_local.strftime("%-I:%M %p"),
+                "eventNames": unique_names,
+            })
+        if query:
+            shared_door_windows = [
+                item for item in shared_door_windows
+                if query in " ".join([item["doorLabel"], *item["eventNames"]]).lower()
+            ]
+        shared_door_windows.sort(key=lambda item: (item["startLabel"], item["doorLabel"]))
+
+        timeline_rows: list[dict] = []
+        timeline_by_key: dict[str, dict] = {}
+        timeline_seed_keys = selected_door_keys or door_keys
+        for dk in timeline_seed_keys:
+            row = {
+                "key": dk,
+                "label": str((doors_cfg.get(dk) or {}).get("label") or dk),
+                "color": door_color_map.get(dk, _DOOR_COLORS[0]),
+                "days": {day["date"]: [] for day in day_rows},
+            }
+            timeline_rows.append(row)
+            timeline_by_key[dk] = row
+
+        for window in (preview.get("schedule") or {}).get("doorWindows") or []:
+            door_key = str(window.get("doorKey") or "")
+            if selected_door_key_set and door_key not in selected_door_key_set:
+                continue
+            if door_key not in timeline_by_key:
+                row = {
+                    "key": door_key,
+                    "label": str(window.get("doorLabel") or door_key),
+                    "color": door_color_map.get(door_key, _DOOR_COLORS[len(timeline_rows) % len(_DOOR_COLORS)]),
+                    "days": {day["date"]: [] for day in day_rows},
+                }
+                timeline_rows.append(row)
+                timeline_by_key[door_key] = row
+            start_utc = parse_iso(window.get("openStart"))
+            end_utc = parse_iso(window.get("openEnd"))
+            if not start_utc or not end_utc:
+                continue
+            current_local = start_utc.astimezone(local_tz)
+            end_local = end_utc.astimezone(local_tz)
+            names = list(dict.fromkeys([
+                str(name or "").strip()
+                for name in (window.get("sourceEventNames") or [])
+                if str(name or "").strip()
+            ]))
+            title_query_text = " ".join([timeline_by_key[door_key]["label"], *names]).lower()
+            if query and query not in title_query_text:
+                continue
+            while current_local < end_local:
+                next_midnight = (current_local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                segment_end = min(end_local, next_midnight)
+                date_key = current_local.date().isoformat()
+                if date_key in timeline_by_key[door_key]["days"]:
+                    start_min = current_local.hour * 60 + current_local.minute
+                    end_min = segment_end.hour * 60 + segment_end.minute
+                    if end_min == 0:
+                        end_min = 1440
+                    if end_min > start_min:
+                        timeline_by_key[door_key]["days"][date_key].append({
+                            "startMin": start_min,
+                            "endMin": end_min,
+                            "title": f"{timeline_by_key[door_key]['label']}: "
+                                     f"{current_local.strftime('%-I:%M %p')} - {segment_end.strftime('%-I:%M %p')}"
+                                     + (f" | {', '.join(names)}" if names else ""),
+                            "events": names,
+                        })
+                current_local = next_midnight
+
+        for row in timeline_rows:
+            for date_key in row["days"]:
+                row["days"][date_key].sort(key=lambda item: (item["startMin"], item["endMin"]))
+        if query:
+            timeline_rows = [
+                row for row in timeline_rows
+                if query in row["label"].lower() or any(row["days"][day["date"]] for day in day_rows)
+            ]
+
+        return {
+            "days": days,
+            "selectedView": selected_view,
+            "availableViews": _build_schedule_views(mapping),
+            "query": raw_query,
+            "timezone": settings.display_timezone,
+            "generatedAt": now.astimezone(local_tz).strftime("%a %b %-d, %-I:%M %p"),
+            "summary": {
+                "eventCount": len([item for item in board_events if item["type"] == "event"]),
+                "totalItems": len(board_events),
+                "activeDoors": len([row for row in timeline_rows if any(row["days"][day["date"]] for day in day_rows)]),
+                "roomConflictCount": len(room_conflicts),
+                "sharedDoorCount": len(shared_door_windows),
+            },
+            "dayRows": day_rows,
+            "timelineRows": timeline_rows,
+            "roomConflicts": room_conflicts,
+            "sharedDoorWindows": shared_door_windows,
+        }
+
     def _nav(active: str) -> str:
         """Generate the shared site header HTML."""
         pages = [
             ("dashboard",        "/dashboard",        "Dashboard"),
+            ("schedule-board",   "/schedule-board",   "Schedule Board"),
             ("settings",         "/settings",         "Room Mapping"),
             ("office-hours",     "/office-hours",     "Office Hours"),
             ("event-overrides",  "/event-overrides",  "Event Overrides"),
@@ -540,6 +1186,22 @@ def create_app() -> FastAPI:
 
         color_for_key = {dk: _DOOR_COLORS[i % len(_DOOR_COLORS)] for i, dk in enumerate(all_door_keys)}
         local_tz = ZoneInfo(settings.display_timezone)
+        local_today = now.astimezone(local_tz).date()
+        local_today_start = datetime.combine(local_today, datetime.min.time(), tzinfo=local_tz)
+        visible_date_keys = {
+            (local_today + timedelta(days=offset)).isoformat()
+            for offset in range(7)
+        }
+        day_dates_by_weekday = {
+            (local_today + timedelta(days=offset)).weekday(): {
+                "weekday": (local_today + timedelta(days=offset)).weekday(),
+                "dayLabel": (local_today + timedelta(days=offset)).strftime("%a"),
+                "dateLabel": (local_today + timedelta(days=offset)).strftime("%-m/%-d"),
+                "isoDate": (local_today + timedelta(days=offset)).isoformat(),
+                "isToday": offset == 0,
+            }
+            for offset in range(7)
+        }
         door_map: dict[str, dict] = {}
         active_names_by_key: dict[str, list[str]] = {}
         active_count_by_key: dict[str, int] = {}
@@ -550,8 +1212,9 @@ def create_app() -> FastAPI:
                 end_utc = datetime.fromisoformat(str(w["openEnd"]).replace("Z", "+00:00"))
             except Exception:
                 continue
-            # Door schedule UI is "current + upcoming"; hide fully-ended windows.
-            if end_utc <= now:
+            # Keep windows from the current local day even after they have ended so
+            # operators can still review what opened earlier today on the timeline.
+            if end_utc.astimezone(local_tz) <= local_today_start:
                 continue
             key = w["doorKey"]
             if key not in door_map:
@@ -580,7 +1243,10 @@ def create_app() -> FastAPI:
                 end_min   = seg_end.hour * 60 + seg_end.minute
                 if end_min == 0:
                     end_min = 1440
-                if end_min > start_min:
+                # The dashboard timeline shows a rolling 7 local-day window.
+                # Keep only those visible dates before merging by weekday so
+                # names from a different calendar week cannot leak into a bar.
+                if end_min > start_min and cur.date().isoformat() in visible_date_keys:
                     door_map[key]["windows"].append({
                         "day": cur.weekday(),  # 0=Mon … 6=Sun
                         "startMin": start_min,
@@ -645,7 +1311,12 @@ def create_app() -> FastAPI:
         # Return in mapping order so colors and display order stay consistent
         ordered = [door_map[dk] for dk in all_door_keys if dk in door_map]
         ordered += [v for dk, v in door_map.items() if dk not in all_door_keys]
-        return {"timezone": settings.display_timezone, "now": now.isoformat(), "doors": ordered}
+        return {
+            "timezone": settings.display_timezone,
+            "now": now.isoformat(),
+            "dayDatesByWeekday": day_dates_by_weekday,
+            "doors": ordered,
+        }
 
     @app.get("/api/pco/calendars")
     async def api_pco_calendars() -> dict:
@@ -672,6 +1343,10 @@ def create_app() -> FastAPI:
         now = datetime.now(timezone.utc)
         end_dt = now + timedelta(hours=int(hours))
         return await sync_service.get_preview(start_dt=now, end_dt=end_dt, limit=limit)
+
+    @app.get("/api/schedule-board")
+    async def api_schedule_board(days: int = 7, view: str = "all", q: str = "") -> dict:
+        return await _build_schedule_board(days, view_key=view, query=q)
 
     @app.get("/api/config")
     async def api_config() -> dict:
@@ -794,6 +1469,7 @@ def create_app() -> FastAPI:
         start_at = str(payload.get("startAt") or "").strip()
         end_at = str(payload.get("endAt") or "").strip()
         note = str(payload.get("note") or "").strip()
+        override_approval = str(payload.get("overrideApproval") or "").strip().lower() in ("1", "true", "yes", "on")
         mapping = _read_mapping()
         doors_map = mapping.get("doors") or {}
         if not door_keys_raw:
@@ -813,6 +1489,19 @@ def create_app() -> FastAPI:
         if err:
             _audit(request, action="manual_access.create", target=",".join(door_keys_raw), result="error", error=err)
             return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        approval_reason = _manual_access_approval_reason(start_at, end_at)
+        if approval_reason and not override_approval:
+            _audit(
+                request,
+                action="manual_access.create",
+                target=",".join(door_keys_raw),
+                result="needs_approval",
+                error=approval_reason,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "requiresApproval": True, "error": approval_reason},
+            )
         entry = create_manual_access_entry(
             manual_access_file,
             door_keys=door_keys_raw,
@@ -821,11 +1510,12 @@ def create_app() -> FastAPI:
             note=note,
         )
         door_labels = ", ".join(str((doors_map.get(k) or {}).get("label") or k) for k in door_keys_raw)
+        approval_note = " [outside safe hours confirmed]" if approval_reason else ""
         _audit(
             request,
             action="manual_access.create",
             target=str(entry.get("id") or ""),
-            note=f"{door_labels} {start_at} -> {end_at} ({note})",
+            note=f"{door_labels} {start_at} -> {end_at} ({note}){approval_note}",
         )
         sync_warning = ""
         try:
@@ -833,10 +1523,106 @@ def create_app() -> FastAPI:
         except Exception as exc:
             sync_warning = str(exc)
         notify_msg = f"Quick Door Access set: {door_labels} — {note} ({start_at} → {end_at})"
+        if approval_reason:
+            notify_msg += " [outside safe hours confirmed]"
         if sync_warning:
             notify_msg += f" [sync warning: {sync_warning}]"
         await _notify(request, notify_msg)
-        return {"ok": True, "entry": entry, "syncWarning": sync_warning}
+        return {
+            "ok": True,
+            "entry": entry,
+            "syncWarning": sync_warning,
+            "approvedOutsideSafeHours": bool(approval_reason),
+        }
+
+    @app.post("/api/manual-access/update")
+    async def api_manual_access_update(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+
+        entry_id = str(payload.get("id") or "").strip()
+        raw_keys = payload.get("doorKeys")
+        if raw_keys and isinstance(raw_keys, list):
+            door_keys_raw = [str(k).strip() for k in raw_keys if str(k).strip()]
+        else:
+            single = str(payload.get("doorKey") or "").strip()
+            door_keys_raw = [single] if single else []
+        start_at = str(payload.get("startAt") or "").strip()
+        end_at = str(payload.get("endAt") or "").strip()
+        note = str(payload.get("note") or "").strip()
+        override_approval = str(payload.get("overrideApproval") or "").strip().lower() in ("1", "true", "yes", "on")
+        if not entry_id:
+            err = "id required"
+            _audit(request, action="manual_access.update", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        mapping = _read_mapping()
+        doors_map = mapping.get("doors") or {}
+        if not door_keys_raw:
+            err = "Select a door or group"
+            _audit(request, action="manual_access.update", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        invalid_keys = [k for k in door_keys_raw if k not in doors_map]
+        if invalid_keys:
+            err = f"Unknown door key(s): {', '.join(invalid_keys)}"
+            _audit(request, action="manual_access.update", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        if not note:
+            err = "Description is required"
+            _audit(request, action="manual_access.update", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        err = validate_manual_access_window(start_at=start_at, end_at=end_at, door_keys=door_keys_raw)
+        if err:
+            _audit(request, action="manual_access.update", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+        approval_reason = _manual_access_approval_reason(start_at, end_at)
+        if approval_reason and not override_approval:
+            _audit(
+                request,
+                action="manual_access.update",
+                target=entry_id,
+                result="needs_approval",
+                error=approval_reason,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={"ok": False, "requiresApproval": True, "error": approval_reason},
+            )
+        entry = update_manual_access_entry(
+            manual_access_file,
+            entry_id=entry_id,
+            door_keys=door_keys_raw,
+            start_at=start_at,
+            end_at=end_at,
+            note=note,
+        )
+        if entry is None:
+            err = "Manual access window not found"
+            _audit(request, action="manual_access.update", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=404, content={"ok": False, "error": err})
+        door_labels = ", ".join(str((doors_map.get(k) or {}).get("label") or k) for k in door_keys_raw)
+        approval_note = " [outside safe hours confirmed]" if approval_reason else ""
+        _audit(
+            request,
+            action="manual_access.update",
+            target=entry_id,
+            note=f"{door_labels} {start_at} -> {end_at} ({note}){approval_note}",
+        )
+        sync_warning = ""
+        try:
+            await sync_service.run_once()
+        except Exception as exc:
+            sync_warning = str(exc)
+        notify_msg = f"Quick Door Access updated: {door_labels} — {note} ({start_at} → {end_at})"
+        if approval_reason:
+            notify_msg += " [outside safe hours confirmed]"
+        if sync_warning:
+            notify_msg += f" [sync warning: {sync_warning}]"
+        await _notify(request, notify_msg)
+        return {
+            "ok": True,
+            "entry": entry,
+            "syncWarning": sync_warning,
+            "approvedOutsideSafeHours": bool(approval_reason),
+        }
 
     @app.post("/api/manual-access/cancel")
     async def api_manual_access_cancel(request: Request, payload: dict = Body(...)) -> dict:
@@ -872,6 +1658,108 @@ def create_app() -> FastAPI:
             await sync_service.run_once()
         except Exception as exc:
             sync_warning = str(exc)
+        return {"ok": True, "syncWarning": sync_warning}
+
+    @app.get("/api/exception-calendar")
+    async def api_exception_calendar() -> dict:
+        return {"entries": list_exception_entries(exception_calendar_file)}
+
+    @app.post("/api/exception-calendar")
+    async def api_exception_calendar_create(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+
+        kind = str(payload.get("kind") or "").strip()
+        from_date_str = str(payload.get("fromDate") or payload.get("date") or "").strip()
+        to_date_str = str(payload.get("toDate") or from_date_str).strip()
+        label = str(payload.get("label") or "").strip()
+        note = str(payload.get("note") or "").strip()
+        start_time = str(payload.get("startTime") or "").strip()
+        end_time = str(payload.get("endTime") or "").strip()
+        raw_keys = payload.get("doorKeys")
+        door_keys = [str(k).strip() for k in raw_keys if str(k).strip()] if isinstance(raw_keys, list) else []
+
+        mapping = _read_mapping()
+        doors_map = mapping.get("doors") or {}
+        invalid_keys = [k for k in door_keys if k not in doors_map]
+        if invalid_keys:
+            err = f"Unknown door key(s): {', '.join(invalid_keys)}"
+            _audit(request, action="exception_calendar.create", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+
+        err = validate_exception_entry(
+            kind=kind,
+            from_date_str=from_date_str,
+            to_date_str=to_date_str,
+            door_keys=door_keys,
+            label=label,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        if err:
+            _audit(request, action="exception_calendar.create", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+
+        entry = create_exception_entry(
+            exception_calendar_file,
+            kind=kind,
+            from_date_str=from_date_str,
+            to_date_str=to_date_str,
+            door_keys=door_keys,
+            label=label,
+            note=note,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        target_text = ", ".join(
+            str((doors_map.get(k) or {}).get("label") or k)
+            for k in (entry.get("doorKeys") or [])
+        ) or "All doors"
+        _audit(
+            request,
+            action="exception_calendar.create",
+            target=str(entry.get("id") or ""),
+            note=f"{kind} {from_date_str}..{to_date_str} {target_text} {label}",
+        )
+        sync_warning = ""
+        try:
+            await sync_service.run_once()
+        except Exception as exc:
+            sync_warning = str(exc)
+        if from_date_str == to_date_str:
+            notify_range = from_date_str
+        else:
+            notify_range = f"{from_date_str} to {to_date_str}"
+        await _notify(request, f"Office Hours Calendar added: {label} ({kind} on {notify_range})")
+        return {"ok": True, "entry": entry, "syncWarning": sync_warning}
+
+    @app.post("/api/exception-calendar/delete")
+    async def api_exception_calendar_delete(request: Request, payload: dict = Body(...)) -> dict:
+        from fastapi.responses import JSONResponse
+
+        entry_id = str(payload.get("id") or "").strip()
+        if not entry_id:
+            err = "id required"
+            _audit(request, action="exception_calendar.delete", result="error", error=err)
+            return JSONResponse(status_code=422, content={"ok": False, "error": err})
+
+        removed = delete_exception_entry(exception_calendar_file, entry_id)
+        if removed is None:
+            err = "Exception entry not found"
+            _audit(request, action="exception_calendar.delete", target=entry_id, result="error", error=err)
+            return JSONResponse(status_code=404, content={"ok": False, "error": err})
+
+        _audit(
+            request,
+            action="exception_calendar.delete",
+            target=entry_id,
+            note=f"{str(removed.get('kind') or '')} {str(removed.get('fromDate') or removed.get('date') or '')}..{str(removed.get('toDate') or removed.get('fromDate') or removed.get('date') or '')} {str(removed.get('label') or '')}",
+        )
+        sync_warning = ""
+        try:
+            await sync_service.run_once()
+        except Exception as exc:
+            sync_warning = str(exc)
+        await _notify(request, f"Office Hours Calendar removed: {str(removed.get('label') or entry_id)}")
         return {"ok": True, "syncWarning": sync_warning}
 
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -1006,7 +1894,7 @@ def create_app() -> FastAPI:
         manual_entries = list_manual_access(manual_access_file)
         door_groups_cfg: dict = (mapping.get("doorGroups") or {}) if isinstance(mapping, dict) else {}
         _indiv_opts = "".join(
-            f'<option value="single:{_esc(dk, quote=True)}">'
+            f'<option value="single:{_esc(dk, quote=True)}" data-keys="{_esc(dk, quote=True)}">'
             f'{_esc(str((doors_map.get(dk) or {}).get("label") or dk))}</option>'
             for dk in door_keys
         )
@@ -1029,17 +1917,25 @@ def create_app() -> FastAPI:
             ]
             note_text = str(entry.get("note") or "").strip()
             note_html = _esc(note_text) if note_text else '<span style="color:#9ca3af">—</span>'
+            edit_btn = (
+                f'<button class="sm" data-id="{_esc(entry_id)}" '
+                f'data-keys="{_esc(",".join(str(dk) for dk in (entry.get("doorKeys") or [])), quote=True)}" '
+                f'data-start="{_esc(str(entry.get("startAt") or ""), quote=True)}" '
+                f'data-end="{_esc(str(entry.get("endAt") or ""), quote=True)}" '
+                f'data-note="{_esc(note_text, quote=True)}" '
+                f'onclick="editManualAccess(this)">Edit</button>'
+            )
             cancel_btn = (
-                f'<button class="sm danger" data-id="{_esc(entry_id)}" '
+                f'<button class="sm danger" data-id="{_esc(entry_id)}" style="margin-left:6px;" '
                 f'onclick="cancelManualAccess(this)">Cancel</button>'
             )
             manual_rows.append(
                 "<tr>"
-                f'<td>{_esc(", ".join([d for d in entry_doors if d]) or "(unknown)")}</td>'
-                f'<td style="white-space:nowrap">{_fmt_dt_cell(entry.get("startAt"))}</td>'
-                f'<td style="white-space:nowrap">{_fmt_dt_cell(entry.get("endAt"))}</td>'
-                f"<td>{note_html}</td>"
-                f"<td>{cancel_btn}</td>"
+                f'<td class="meta-cell" data-label="Door">{_esc(", ".join([d for d in entry_doors if d]) or "(unknown)")}</td>'
+                f'<td class="time-cell" data-label="Start" style="white-space:nowrap">{_fmt_dt_cell(entry.get("startAt"))}</td>'
+                f'<td class="time-cell" data-label="End" style="white-space:nowrap">{_fmt_dt_cell(entry.get("endAt"))}</td>'
+                f'<td class="meta-cell" data-label="Description">{note_html}</td>'
+                f'<td class="actions-cell" data-label="Actions">{edit_btn}{cancel_btn}</td>'
                 "</tr>"
             )
         manual_rows_html = "\n".join(manual_rows)
@@ -1128,12 +2024,12 @@ def create_app() -> FastAPI:
                 )
                 events_rows_list.append(
                     '<tr style="background:#f0fdf4">'
-                    f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
-                    f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
-                    f"<td><strong>{_esc(ename)}</strong>{oh_badge}</td>"
-                    f'<td class="hide-mob">{rooms_str}</td>'
-                    f'<td class="hide-mob">{doors_html}</td>'
-                    f'<td style="white-space:nowrap">{cancel_btn}</td>'
+                    f'<td class="time-cell" data-label="Start" style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
+                    f'<td class="time-cell" data-label="End" style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
+                    f'<td class="event-name-cell" data-label="Event"><strong>{_esc(ename)}</strong>{oh_badge}</td>'
+                    f'<td class="hide-mob meta-cell" data-label="Room(s)">{rooms_str}</td>'
+                    f'<td class="hide-mob meta-cell" data-label="Door Group(s)">{doors_html}</td>'
+                    f'<td class="actions-cell" data-label="Actions" style="white-space:nowrap">{cancel_btn}</td>'
                     "</tr>"
                 )
                 continue
@@ -1200,12 +2096,12 @@ def create_app() -> FastAPI:
             )
             events_rows_list.append(
                 "<tr>"
-                f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
-                f'<td style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
-                f"<td><strong>{_esc(ename)}</strong>{override_badge}{override_detail_html}</td>"
-                f'<td class="hide-mob">{rooms_str}</td>'
-                f'<td class="hide-mob">{doors_html}</td>'
-                f'<td style="white-space:nowrap">{cancel_btn}<br/>{override_btn}</td>'
+                f'<td class="time-cell" data-label="Start" style="white-space:nowrap">{_fmt_dt_cell(e.get("startAt"))}</td>'
+                f'<td class="time-cell" data-label="End" style="white-space:nowrap">{_fmt_dt_cell(e.get("endAt"))}</td>'
+                f'<td class="event-name-cell" data-label="Event"><strong>{_esc(ename)}</strong>{override_badge}{override_detail_html}</td>'
+                f'<td class="hide-mob meta-cell" data-label="Room(s)">{rooms_str}</td>'
+                f'<td class="hide-mob meta-cell" data-label="Door Group(s)">{doors_html}</td>'
+                f'<td class="actions-cell" data-label="Actions" style="white-space:nowrap">{cancel_btn}<br/>{override_btn}</td>'
                 "</tr>"
             )
         events_rows = "\n".join(events_rows_list)
@@ -1338,10 +2234,10 @@ def create_app() -> FastAPI:
                 "</tr>"
             )
         audit_card_html = f"""
-    <details class="collapsible">
+    <details class="collapsible" id="recentChangesDetails">
       <summary><span>Recent Changes</span></summary>
       <div class="details-body">
-        <div style="overflow:auto;">
+        <div class="table-wrap">
           <table>
             <thead><tr><th>When</th><th>Action</th><th>Target</th><th>Who</th><th>Detail</th><th>Result</th></tr></thead>
             <tbody>
@@ -1401,6 +2297,8 @@ def create_app() -> FastAPI:
     .quick-access-grid label {{ font-size: 12px; color:#64748b; font-weight:600; display:block; margin-bottom:4px; }}
     .quick-access-grid input, .quick-access-grid select {{ width:100%; }}
     .event-count {{ font-size: 12px; color: #64748b; font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }}
+    #doorStatusCard {{ overflow-anchor: none; }}
+    #dsBody {{ min-height: 240px; }}
     .help-tip {{
       display:inline-flex; align-items:center; justify-content:center;
       width:16px; height:16px; border-radius:999px; margin-left:6px;
@@ -1424,6 +2322,7 @@ def create_app() -> FastAPI:
     .help-tip:hover::before, .help-tip:focus-visible::before,
     .help-tip:hover::after, .help-tip:focus-visible::after {{ opacity:1; }}
     .show-mob {{ display: none; }}
+    .events-wrap, .manual-wrap {{ overflow: visible; }}
     @media (max-width: 640px) {{
       .show-mob {{ display: inline; }}
       .status-bar {{ gap: 10px; }}
@@ -1432,12 +2331,37 @@ def create_app() -> FastAPI:
       .status-actions button, .status-actions form {{ flex: 1; }}
       .status-actions form button {{ width: 100%; }}
       .event-count {{ display: block; margin: 4px 0 0; }}
+      #dsBody {{ min-height: 200px; }}
       .help-tip::after {{ min-width: 180px; max-width: min(280px, calc(100vw - 32px)); left:auto; right:0; transform:none; }}
       .help-tip::before {{ left:auto; right:6px; transform:none; }}
     }}
     .sched-grid {{ width: 100%; }}
-    .sched-lbl {{ width: 28px; flex-shrink: 0; font-size: 10px; color: #94a3b8; padding-right: 4px;
-      display: flex; align-items: center; justify-content: flex-end; }}
+    .sched-day-row {{
+      --sched-row-bg: transparent;
+      background: var(--sched-row-bg);
+      border-radius: 10px;
+      transition: background-color .14s ease, box-shadow .14s ease, background .14s ease;
+    }}
+    .sched-day-row.sched-day-clickable {{ cursor: pointer; }}
+    .sched-day-row.sched-day-clickable:hover {{ background: linear-gradient(90deg, rgba(248,250,252,.92) 0%, rgba(241,245,249,.96) 100%); }}
+    .sched-day-row.sched-day-today {{
+      background: linear-gradient(90deg, rgba(219,234,254,.72) 0%, rgba(239,246,255,.94) 100%);
+      box-shadow: inset 0 0 0 1px #dbeafe;
+    }}
+    .sched-day-row.sched-day-selected {{
+      background: linear-gradient(90deg, rgba(191,219,254,.96) 0%, rgba(219,234,254,1) 100%);
+      box-shadow: inset 0 0 0 1px #60a5fa;
+    }}
+    .sched-day-row.sched-day-selected .sched-lbl {{ color: #1d4ed8; font-weight: 700; }}
+    .sched-lbl {{ width: 52px; flex-shrink: 0; font-size: 10px; color: #94a3b8; padding-right: 6px;
+      display: flex; align-items: center; justify-content: flex-end; text-align: right; }}
+    .sched-lbl-inner {{ display:flex; flex-direction:column; align-items:flex-end; line-height:1.05; gap:2px; }}
+    .sched-lbl-day {{ font-size:10px; font-weight:700; color:#64748b; }}
+    .sched-lbl-date {{ font-size:9px; color:#94a3b8; }}
+    .sched-lbl-expanded {{ width: 78px; padding-right: 10px; }}
+    .sched-lbl-expanded .sched-lbl-inner {{ gap: 3px; }}
+    .sched-lbl-expanded .sched-lbl-day {{ font-size: 13px; }}
+    .sched-lbl-expanded .sched-lbl-date {{ font-size: 11px; font-weight: 600; }}
     .sched-track {{ position: relative; flex: 1; border-left: 1px solid #e2e8f0; }}
     .sched-hr {{ position: absolute; font-size: 9px; color: #94a3b8; transform: translateX(-50%); top: 1px; user-select: none; }}
     .sched-vline {{ position: absolute; top: 0; bottom: 0; border-left: 1px solid #f3f4f6; }}
@@ -1545,7 +2469,7 @@ def create_app() -> FastAPI:
 
     {pending_card_html}
 
-    <details class="collapsible">
+    <details class="collapsible" id="quickAccessDetails">
       <summary>
         <span>Quick Door Access {help_quick_access}</span>
         {f'<span style="margin-left:8px;font-size:12px;font-weight:700;padding:1px 7px;border-radius:10px;background:#dbeafe;color:#1d4ed8;vertical-align:middle">{len(manual_entries)} active</span>' if manual_entries else ""}
@@ -1554,7 +2478,11 @@ def create_app() -> FastAPI:
         <p style="font-size:13px;color:#64748b;margin:0 0 12px;">
           Create a temporary unlock window for one door group without changing PCO or office hours. The picker uses this device's local time; times are shown in <strong>{_esc(settings.display_timezone)}</strong>.
         </p>
+        <p style="font-size:12px;color:#94a3b8;margin:0 0 12px;">
+          If the requested window falls outside your safe hours, the app will ask for one extra approval check before saving it.
+        </p>
         <form id="quickAccessForm">
+          <input id="qaEditId" type="hidden" />
           <div class="quick-access-grid">
             <div>
               <label for="qaDoor">Door Group</label>
@@ -1576,13 +2504,17 @@ def create_app() -> FastAPI:
               <input id="qaNote" type="text" maxlength="120" placeholder="e.g. Special event – extra access needed" required />
             </div>
           </div>
+          <div id="qaEditState" style="display:none;margin-top:10px;padding:8px 10px;border-radius:8px;background:#eff6ff;color:#1d4ed8;font-size:13px;font-weight:600;">
+            Editing scheduled manual access window.
+          </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;">
             <button type="button" class="sm" onclick="setQuickAccessNow()">Start Now</button>
             <button type="button" class="sm" onclick="setQuickAccessDuration(15)">+15 min</button>
             <button type="button" class="sm" onclick="setQuickAccessDuration(30)">+30 min</button>
             <button type="button" class="sm" onclick="setQuickAccessDuration(60)">+60 min</button>
             <button type="button" class="sm" onclick="setQuickAccessDuration(120)">+120 min</button>
-            <button type="submit" class="primary sm">Schedule Access</button>
+            <button id="qaSubmitBtn" type="submit" class="primary sm">Schedule Access</button>
+            <button id="qaCancelEditBtn" type="button" class="sm" style="display:none;" onclick="clearQuickAccessEdit()">Cancel Edit</button>
           </div>
         </form>
       </div>
@@ -1593,8 +2525,8 @@ def create_app() -> FastAPI:
         <span style="font-weight:700;font-size:14px;color:#1e40af;">&#128274; Scheduled Manual Access</span>
         <span style="font-size:12px;font-weight:700;padding:1px 7px;border-radius:10px;background:#dbeafe;color:#1d4ed8;">{len(manual_entries)} window{"s" if len(manual_entries) != 1 else ""}</span>
       </div>
-      <div style="overflow:auto;">
-        <table>
+      <div class="table-wrap manual-wrap">
+        <table class="mobile-cards-table manual-table">
           <thead><tr><th>Door</th><th>Start</th><th>End</th><th>Description</th><th>Action</th></tr></thead>
           <tbody>
             {manual_rows_html}
@@ -1621,8 +2553,8 @@ def create_app() -> FastAPI:
         Upcoming Events {help_upcoming}
         <span class="event-count">· {evt_count} event{evt_plural} · {item_count} schedule item{item_plural}</span>
       </span>
-      <div style="overflow:auto;">
-        <table>
+      <div class="table-wrap events-wrap">
+        <table class="mobile-cards-table events-table">
           <thead>
             <tr>
               <th>Start</th>
@@ -1688,7 +2620,7 @@ def create_app() -> FastAPI:
     <details class="collapsible">
       <summary><span>Room → Door Mapping {help_room_mapping}</span></summary>
       <div class="details-body">
-        <div style="overflow:auto;">
+        <div class="table-wrap">
           <table>
             <thead>
               <tr><th>Room</th><th>Door group(s)</th><th>UniFi door IDs</th></tr>
@@ -1730,6 +2662,63 @@ def create_app() -> FastAPI:
         + ':' + pad(date.getMinutes());
     }}
 
+    function _fromIsoToInputValue(isoValue) {{
+      const dt = new Date(isoValue);
+      if (Number.isNaN(dt.getTime())) return '';
+      return _toInputValue(dt);
+    }}
+
+    function _normalizeDoorKeys(keys) {{
+      return [...keys].filter(Boolean).sort().join(',');
+    }}
+
+    function _findDoorOptionForKeys(keys) {{
+      const normalized = _normalizeDoorKeys(keys);
+      const sel = document.getElementById('qaDoor');
+      for (const opt of sel.options) {{
+        const optionKeys = (opt.dataset.keys || '').split(',').filter(Boolean);
+        if (_normalizeDoorKeys(optionKeys) === normalized) return opt.value;
+      }}
+      return '';
+    }}
+
+    function clearQuickAccessEdit() {{
+      document.getElementById('qaEditId').value = '';
+      document.getElementById('qaEditState').style.display = 'none';
+      document.getElementById('qaSubmitBtn').textContent = 'Schedule Access';
+      document.getElementById('qaCancelEditBtn').style.display = 'none';
+      document.getElementById('quickAccessForm').reset();
+      setQuickAccessNow();
+      setQuickAccessDuration(30);
+    }}
+
+    function editManualAccess(btn) {{
+      const details = document.getElementById('quickAccessDetails');
+      if (details && !details.open) {{
+        details.open = true;
+      }}
+      const optionValue = _findDoorOptionForKeys((btn.dataset.keys || '').split(',').filter(Boolean));
+      if (!optionValue) {{
+        _showToast('This entry uses a door combination that cannot be edited from the current dropdown.', false);
+        return;
+      }}
+      document.getElementById('qaEditId').value = btn.dataset.id || '';
+      document.getElementById('qaDoor').value = optionValue;
+      document.getElementById('qaStartAt').value = _fromIsoToInputValue(btn.dataset.start || '');
+      document.getElementById('qaEndAt').value = _fromIsoToInputValue(btn.dataset.end || '');
+      document.getElementById('qaNote').value = btn.dataset.note || '';
+      document.getElementById('qaEditState').style.display = 'block';
+      document.getElementById('qaSubmitBtn').textContent = 'Update Access';
+      document.getElementById('qaCancelEditBtn').style.display = 'inline-flex';
+      setTimeout(() => {{
+        const form = document.getElementById('quickAccessForm');
+        if (form) {{
+          form.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+        }}
+        document.getElementById('qaNote').focus();
+      }}, details && details.open ? 140 : 0);
+    }}
+
     function setQuickAccessNow() {{
       document.getElementById('qaStartAt').value = _toInputValue(new Date());
     }}
@@ -1740,6 +2729,20 @@ def create_app() -> FastAPI:
       let start = startEl.value ? new Date(startEl.value) : new Date();
       if (Number.isNaN(start.getTime())) start = new Date();
       endEl.value = _toInputValue(new Date(start.getTime() + minutes * 60000));
+    }}
+
+    async function saveQuickAccessRequest(url, payload) {{
+      const resp = await fetch(url, {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify(payload),
+      }});
+      const data = await resp.json();
+      if (data && data.requiresApproval) {{
+        return {{ needsApproval: true, data }};
+      }}
+      if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+      return {{ needsApproval: false, data }};
     }}
 
     async function submitQuickAccess(event) {{
@@ -1756,6 +2759,7 @@ def create_app() -> FastAPI:
       const startValue = document.getElementById('qaStartAt').value;
       const endValue = document.getElementById('qaEndAt').value;
       const note = (document.getElementById('qaNote').value || '').trim();
+      const editId = document.getElementById('qaEditId').value;
       if (!doorKeys.length || !startValue || !endValue) {{
         _showToast('Door, start, and end are required.', false);
         return;
@@ -1772,27 +2776,40 @@ def create_app() -> FastAPI:
         return;
       }}
       try {{
-        const resp = await fetch('/api/manual-access', {{
-          method: 'POST',
-          headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{
+        const url = editId ? '/api/manual-access/update' : '/api/manual-access';
+        let result = await saveQuickAccessRequest(url, {{
+          id: editId || undefined,
+          doorKeys,
+          startAt: startAt.toISOString(),
+          endAt: endAt.toISOString(),
+          note,
+        }});
+        if (result.needsApproval) {{
+          const approvalMessage = result.data.error || 'This manual access window falls outside safe hours and needs approval.';
+          const confirmMsg = approvalMessage + '\\n\\nApprove and save this manual access window?';
+          if (!confirm(confirmMsg)) return;
+          result = await saveQuickAccessRequest(url, {{
+            id: editId || undefined,
             doorKeys,
             startAt: startAt.toISOString(),
             endAt: endAt.toISOString(),
             note,
-          }}),
-        }});
-        const data = await resp.json();
-        if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+            overrideApproval: true,
+          }});
+        }}
+        const data = result.data;
         if (data.syncWarning) {{
-          _showToast('Saved, but sync failed: ' + data.syncWarning, false);
+          _showToast((editId ? 'Updated' : 'Saved') + ', but sync failed: ' + data.syncWarning, false);
           setTimeout(() => location.reload(), 2200);
+        }} else if (data.approvedOutsideSafeHours) {{
+          _showToast(editId ? 'Outside safe hours confirmed and updated.' : 'Outside safe hours confirmed and scheduled.', true);
+          setTimeout(() => location.reload(), 1200);
         }} else {{
-          _showToast('Temporary door access scheduled.', true);
+          _showToast(editId ? 'Temporary door access updated.' : 'Temporary door access scheduled.', true);
           setTimeout(() => location.reload(), 1200);
         }}
       }} catch (err) {{
-        _showToast('Quick access failed: ' + err.message, false);
+        _showToast((editId ? 'Quick access update failed: ' : 'Quick access failed: ') + err.message, false);
       }}
     }}
 
@@ -1933,6 +2950,7 @@ def create_app() -> FastAPI:
     // ── Door Status ──────────────────────────────────────────────────────────
     const DS_REFRESH_MS = {settings.door_status_refresh_seconds * 1000};
     let _lastSchedData = null;
+    let _schedSelectedDay = null;
 
     async function refreshDoorStatus() {{
       try {{
@@ -1949,11 +2967,33 @@ def create_app() -> FastAPI:
       }}
     }}
 
+    function rerenderSchedViews() {{
+      if (!_lastSchedData) return;
+      renderDoorStatus(_lastSchedData.status, _lastSchedData.sched);
+      const overlay = document.getElementById('schedModalOverlay');
+      if (overlay && overlay.classList.contains('open')) {{
+        openSchedModal();
+      }}
+    }}
+
+    function onSchedDayClick(event, day, mode) {{
+      event.stopPropagation();
+      _schedSelectedDay = (_schedSelectedDay === day) ? null : day;
+      if (mode === 'open') {{
+        renderDoorStatus(_lastSchedData.status, _lastSchedData.sched);
+        openSchedModal();
+        return;
+      }}
+      rerenderSchedViews();
+    }}
+
     // Build a reusable schedule grid (compact or expanded)
-    function buildSchedGrid(doors, opts) {{
+    function buildSchedGrid(doors, schedData, opts) {{
       const laneH = opts.laneH, labelH = opts.labelH, hourStep = opts.hourStep,
-            showLabels = opts.showLabels, altBg = opts.altBg;
+            showLabels = opts.showLabels, altBg = opts.altBg, dayClickMode = opts.dayClickMode || '',
+            expandedLabels = !!opts.expandedLabels;
       const DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+      const dayDatesByWeekday = (schedData && schedData.dayDatesByWeekday) || {{}};
       const n = doors.length;
       const rowH = n * laneH + 4;
       let html = '<div class="sched-grid">';
@@ -1969,9 +3009,26 @@ def create_app() -> FastAPI:
 
       // Day rows
       for (let day = 0; day < 7; day++) {{
+        const dayMeta = dayDatesByWeekday[day] || {{
+          dayLabel: DAYS[day],
+          dateLabel: '',
+          isToday: false
+        }};
+        const rowClasses = ['sched-day-row'];
+        if (dayClickMode) rowClasses.push('sched-day-clickable');
+        if (dayMeta.isToday) rowClasses.push('sched-day-today');
+        if (day === _schedSelectedDay) rowClasses.push('sched-day-selected');
         const bg = (altBg && day%2===0) ? '#f8fafc' : 'transparent';
-        html += '<div style="display:flex;height:' + rowH + 'px;background:' + bg + '">'
-          + '<div class="sched-lbl" style="height:' + rowH + 'px">' + DAYS[day] + '</div>'
+        const clickAttr = dayClickMode
+          ? ' onclick="onSchedDayClick(event,' + day + ',\\'' + dayClickMode + '\\')"'
+          : '';
+        const labelClass = expandedLabels ? 'sched-lbl sched-lbl-expanded' : 'sched-lbl';
+        const labelHtml = '<div class="sched-lbl-inner">'
+          + '<span class="sched-lbl-day">' + dayMeta.dayLabel + '</span>'
+          + (dayMeta.dateLabel ? '<span class="sched-lbl-date">' + dayMeta.dateLabel + '</span>' : '')
+          + '</div>';
+        html += '<div class="' + rowClasses.join(' ') + '" style="display:flex;height:' + rowH + 'px;--sched-row-bg:' + bg + ';"' + clickAttr + '>'
+          + '<div class="' + labelClass + '" style="height:' + rowH + 'px">' + labelHtml + '</div>'
           + '<div class="sched-track">';
         // Grid lines
         for (let h = 0; h <= 24; h++) {{
@@ -2124,7 +3181,7 @@ def create_app() -> FastAPI:
         + buildLegend(doors, liveByKey, idByKey, positionByKey, activeNowByKey, false) + '</div>';
 
       const grid = '<div onclick="openSchedModal()" style="cursor:pointer" title="Click for detail">'
-        + buildSchedGrid(doors, {{laneH:5, labelH:12, hourStep:4, showLabels:false, altBg:true}})
+        + buildSchedGrid(doors, schedData, {{laneH:5, labelH:12, hourStep:4, showLabels:false, altBg:true, dayClickMode:'open'}})
         + '</div>';
 
       body.innerHTML = !doors.length
@@ -2159,7 +3216,7 @@ def create_app() -> FastAPI:
         + '</div>'
         + legend
         + '<div style="font-size:11px;color:#94a3b8;margin-bottom:10px">Times in ' + sch.timezone + '</div>'
-        + buildSchedGrid(doors, {{laneH:22, labelH:18, hourStep:2, showLabels:true, altBg:true}})
+        + buildSchedGrid(doors, sch, {{laneH:22, labelH:18, hourStep:2, showLabels:true, altBg:true, dayClickMode:'select', expandedLabels:true}})
         + '</div>';
       overlay.className = 'sched-modal-overlay open';
     }}
@@ -2426,6 +3483,301 @@ def create_app() -> FastAPI:
 </html>"""
         return HTMLResponse(content=html_out, status_code=200)
 
+    @app.get("/schedule-board", response_class=HTMLResponse)
+    async def schedule_board_page(days: int = 7, view: str = "all", q: str = "") -> HTMLResponse:
+        board = await _build_schedule_board(days, view_key=view, query=q)
+        day_count = int(board["days"])
+        day_rows = board["dayRows"]
+        timeline_rows = board["timelineRows"]
+        summary = board["summary"]
+        room_conflicts = board["roomConflicts"]
+        shared_door_windows = board["sharedDoorWindows"]
+        selected_view = board["selectedView"]
+        available_views = board["availableViews"]
+        board_query = str(board.get("query") or "")
+
+        def _board_url(*, days_value: int, view_value: str, query_value: str) -> str:
+            params = {"days": str(days_value)}
+            if view_value and view_value != "all":
+                params["view"] = view_value
+            if query_value:
+                params["q"] = query_value
+            return "/schedule-board?" + urlencode(params)
+
+        day_controls = []
+        for option in (3, 7, 14):
+            cls = "pill-link active" if option == day_count else "pill-link"
+            day_controls.append(f'<a href="{_esc(_board_url(days_value=option, view_value=str(selected_view.get("key") or "all"), query_value=board_query), quote=True)}" class="{cls}">{option} Days</a>')
+        day_controls_html = "".join(day_controls)
+
+        view_controls = []
+        for item in available_views:
+            cls = "pill-link active" if item["key"] == selected_view.get("key") else "pill-link"
+            view_controls.append(
+                f'<a href="{_esc(_board_url(days_value=day_count, view_value=str(item["key"]), query_value=board_query), quote=True)}" class="{cls}">{_esc(str(item["label"]))}</a>'
+            )
+        view_controls_html = "".join(view_controls)
+
+        event_columns = []
+        for day in day_rows:
+            event_cards = []
+            for event in day["events"]:
+                badge_cls = {
+                    "event": "evt-badge evt-badge-event",
+                    "office_hours": "evt-badge evt-badge-office",
+                    "manual_access": "evt-badge evt-badge-manual",
+                    "exception_closure": "evt-badge evt-badge-closure",
+                    "exception_open": "evt-badge evt-badge-exception-open",
+                }.get(str(event["type"]), "evt-badge")
+                doors_html = "".join(
+                    f'<span class="door-chip">{_esc(label)}</span>'
+                    for label in event["doorLabels"]
+                ) or '<span class="muted-inline">No doors mapped</span>'
+                event_cards.append(
+                    '<div class="evt-card">'
+                    f'<div class="evt-top"><span class="{badge_cls}">{_esc(event["typeLabel"])}</span>'
+                    f'<span class="evt-time">{_esc(event["startLabel"])} - {_esc(event["endLabel"])}</span></div>'
+                    f'<div class="evt-name">{_esc(event["name"])}</div>'
+                    f'<div class="evt-room">{_esc(event["roomText"])}</div>'
+                    f'<div class="evt-doors">{doors_html}</div>'
+                    '</div>'
+                )
+            events_html = "".join(event_cards) or '<div class="empty-state">No scheduled items.</div>'
+            today_badge = '<span class="today-badge">Today</span>' if day["isToday"] else ""
+            event_columns.append(
+                '<div class="day-column">'
+                f'<div class="day-column-head"><div class="day-title">{_esc(day["longLabel"])}</div>{today_badge}</div>'
+                f'<div class="day-event-count">{len(day["events"])} scheduled item{"s" if len(day["events"]) != 1 else ""}</div>'
+                f'<div class="evt-list">{events_html}</div>'
+                '</div>'
+            )
+        event_columns_html = "".join(event_columns)
+
+        matrix_header = ['<div class="matrix-corner">Door</div>']
+        for day in day_rows:
+            today_cls = " matrix-day-today" if day["isToday"] else ""
+            matrix_header.append(
+                f'<div class="matrix-day{today_cls}"><div>{_esc(day["label"])}</div>'
+                '<div class="matrix-hours">12a  6a  12p  6p</div></div>'
+            )
+
+        matrix_rows = ["".join(matrix_header)]
+        for row in timeline_rows:
+            row_cells = [f'<div class="matrix-label"><span class="door-dot" style="background:{_esc(row["color"])}"></span>{_esc(row["label"])}</div>']
+            for day in day_rows:
+                segments = row["days"].get(day["date"]) or []
+                bars = []
+                for segment in segments:
+                    left = (float(segment["startMin"]) / 1440.0) * 100.0
+                    width = ((float(segment["endMin"]) - float(segment["startMin"])) / 1440.0) * 100.0
+                    bar_text = ""
+                    if width >= 18:
+                        bar_text = (
+                            f'{int(segment["startMin"]) // 60:02d}:{int(segment["startMin"]) % 60:02d}'
+                            f' - '
+                            f'{int(segment["endMin"]) // 60 % 24:02d}:{int(segment["endMin"]) % 60:02d}'
+                        )
+                    bars.append(
+                        f'<div class="time-bar" title="{_esc(segment["title"], quote=True)}" '
+                        f'style="left:{left:.3f}%;width:max({width:.3f}%, 3px);background:{_esc(row["color"])}">'
+                        f'{_esc(bar_text)}</div>'
+                    )
+                row_cells.append(
+                    '<div class="matrix-cell"><div class="time-track">'
+                    '<div class="tick tick-0"></div><div class="tick tick-6"></div>'
+                    '<div class="tick tick-12"></div><div class="tick tick-18"></div>'
+                    f'{"".join(bars)}'
+                    '</div></div>'
+                )
+            matrix_rows.append("".join(row_cells))
+        matrix_html = "".join(matrix_rows)
+
+        room_conflicts_html = "".join(
+            '<div class="warn-row">'
+            f'<strong>{_esc(item["room"])}</strong>: {_esc(item["firstEvent"])} overlaps '
+            f'{_esc(item["secondEvent"])}<br><span class="warn-meta">{_esc(item["startLabel"])} - {_esc(item["endLabel"])}</span>'
+            '</div>'
+            for item in room_conflicts[:12]
+        ) or '<div class="empty-state">No overlapping room bookings in this range.</div>'
+
+        shared_door_html = "".join(
+            '<div class="warn-row">'
+            f'<strong>{_esc(item["doorLabel"])}</strong>: {_esc(", ".join(item["eventNames"]))}<br>'
+            f'<span class="warn-meta">{_esc(item["startLabel"])} - {_esc(item["endLabel"])}</span>'
+            '</div>'
+            for item in shared_door_windows[:12]
+        ) or '<div class="empty-state">No shared door coverage windows in this range.</div>'
+
+        html_out = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Schedule Board — PCO UniFi Sync</title>
+{_PWA_HEAD}  <style>{_SHARED_CSS}
+    .top-row {{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:16px; }}
+    .board-actions {{ display:flex; gap:8px; flex-wrap:wrap; }}
+    .board-toolbar {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; margin:0 0 16px; }}
+    .view-strip {{ display:flex; gap:8px; flex-wrap:wrap; }}
+    .board-search {{ display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }}
+    .board-search label {{ font-size:12px; color:#64748b; font-weight:700; display:block; margin-bottom:4px; }}
+    .board-search input {{ min-width:220px; }}
+    .pill-link {{
+      display:inline-flex; align-items:center; justify-content:center;
+      padding:7px 12px; border-radius:999px; border:1px solid #cbd5e1;
+      color:#475569; text-decoration:none; font-size:13px; font-weight:600; background:#fff;
+    }}
+    .pill-link.active {{ background:#0f172a; border-color:#0f172a; color:#fff; }}
+    .board-note {{ font-size:13px; color:#64748b; max-width:760px; }}
+    .summary-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:12px; margin-bottom:16px; }}
+    .summary-card {{ background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:16px; }}
+    .summary-card .label {{ font-size:11px; color:#94a3b8; text-transform:uppercase; letter-spacing:.06em; }}
+    .summary-card .value {{ font-size:24px; font-weight:700; color:#0f172a; margin-top:4px; }}
+    .summary-card .meta {{ font-size:12px; color:#64748b; margin-top:4px; }}
+    .warning-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-bottom:16px; }}
+    .warn-card {{ background:#fff; border:1px solid #fde68a; border-radius:12px; padding:16px; }}
+    .warn-card.secondary {{ border-color:#bfdbfe; }}
+    .warn-card .card-title {{ margin-bottom:10px; }}
+    .warn-row {{ font-size:13px; color:#334155; padding:10px 0; border-bottom:1px solid #f1f5f9; }}
+    .warn-row:last-child {{ border-bottom:none; padding-bottom:0; }}
+    .warn-meta {{ color:#64748b; font-size:12px; }}
+    .day-grid {{ display:grid; grid-template-columns:repeat({day_count}, minmax(220px, 1fr)); gap:16px; min-width:max-content; }}
+    .day-grid-wrap {{ overflow:auto; padding-bottom:4px; }}
+    .day-column {{ background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:16px; min-height:240px; }}
+    .day-column-head {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:4px; }}
+    .day-title {{ font-size:15px; font-weight:700; color:#0f172a; }}
+    .today-badge {{ font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px; background:#dbeafe; color:#1d4ed8; }}
+    .day-event-count {{ font-size:12px; color:#64748b; margin-bottom:12px; }}
+    .evt-list {{ display:flex; flex-direction:column; gap:10px; }}
+    .evt-card {{ border:1px solid #e2e8f0; border-radius:10px; padding:12px; background:#f8fafc; }}
+    .evt-top {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }}
+    .evt-badge {{ display:inline-block; font-size:10px; font-weight:700; padding:2px 8px; border-radius:999px; }}
+    .evt-badge-event {{ background:#dbeafe; color:#1d4ed8; }}
+    .evt-badge-office {{ background:#dcfce7; color:#166534; }}
+    .evt-badge-manual {{ background:#fef3c7; color:#b45309; }}
+    .evt-badge-closure {{ background:#fee2e2; color:#b91c1c; }}
+    .evt-badge-exception-open {{ background:#ede9fe; color:#6d28d9; }}
+    .evt-time {{ font-size:12px; color:#475569; font-weight:600; }}
+    .evt-name {{ font-size:14px; font-weight:700; color:#0f172a; margin-bottom:4px; }}
+    .evt-room {{ font-size:12px; color:#64748b; margin-bottom:8px; }}
+    .evt-doors {{ display:flex; flex-wrap:wrap; gap:6px; }}
+    .door-chip {{ font-size:11px; color:#1e3a8a; background:#eff6ff; border:1px solid #bfdbfe; border-radius:999px; padding:2px 8px; }}
+    .muted-inline {{ font-size:11px; color:#94a3b8; }}
+    .matrix-wrap {{ overflow:auto; }}
+    .schedule-matrix {{
+      display:grid;
+      grid-template-columns: 160px repeat({day_count}, minmax(220px, 1fr));
+      gap:10px;
+      min-width:max-content;
+      align-items:center;
+    }}
+    .matrix-corner, .matrix-day, .matrix-label, .matrix-cell {{
+      background:#fff; border:1px solid #e2e8f0; border-radius:12px; min-height:74px;
+    }}
+    .matrix-corner {{ display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:.06em; }}
+    .matrix-day {{ padding:12px 14px; font-size:14px; font-weight:700; color:#0f172a; }}
+    .matrix-day-today {{ border-color:#93c5fd; box-shadow:0 0 0 1px #bfdbfe inset; }}
+    .matrix-hours {{ margin-top:6px; font-size:11px; color:#94a3b8; letter-spacing:.08em; }}
+    .matrix-label {{ display:flex; align-items:center; gap:10px; padding:0 14px; font-size:14px; font-weight:600; color:#0f172a; }}
+    .door-dot {{ width:10px; height:10px; border-radius:999px; flex-shrink:0; }}
+    .matrix-cell {{ padding:12px; }}
+    .time-track {{ position:relative; height:48px; border-radius:10px; background:linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); overflow:hidden; }}
+    .tick {{ position:absolute; top:0; bottom:0; width:1px; background:#cbd5e1; opacity:.8; }}
+    .tick-0 {{ left:0; }}
+    .tick-6 {{ left:25%; }}
+    .tick-12 {{ left:50%; }}
+    .tick-18 {{ left:75%; }}
+    .time-bar {{
+      position:absolute; top:8px; bottom:8px; border-radius:8px; color:#fff;
+      font-size:10px; font-weight:700; line-height:32px; padding:0 8px; white-space:nowrap;
+      overflow:hidden; text-overflow:ellipsis; box-shadow:0 4px 12px rgba(15,23,42,.16);
+    }}
+    .empty-state {{ font-size:13px; color:#94a3b8; padding:12px 0; }}
+    @media (max-width: 640px) {{
+      .top-row {{ margin-bottom:12px; }}
+      .summary-card .value {{ font-size:20px; }}
+      .schedule-matrix {{ grid-template-columns: 130px repeat({day_count}, minmax(180px, 1fr)); }}
+      .matrix-corner, .matrix-day, .matrix-label, .matrix-cell {{ min-height:68px; }}
+      .matrix-cell {{ padding:10px; }}
+    }}
+  </style>
+</head>
+<body>
+  {_nav("schedule-board")}
+  <div class="page">
+    <div class="top-row">
+      <div>
+        <h2 class="page-heading">Schedule Board</h2>
+        <p class="page-subtitle-text">Weekly planning view for church operations. Review upcoming events, door coverage, and schedule conflicts without leaving this app.</p>
+        <div class="board-note">Showing the next <strong>{day_count} days</strong> in <strong>{_esc(board["timezone"])}</strong>. View: <strong>{_esc(str(selected_view.get("label") or "All Church"))}</strong>. Generated { _esc(board["generatedAt"]) }.</div>
+      </div>
+      <div class="board-actions">
+        {day_controls_html}
+        <a href="{_esc('/api/schedule-board?' + urlencode({k: v for k, v in [('days', str(day_count)), ('view', str(selected_view.get('key') or 'all')), ('q', board_query)] if v and not (k == 'view' and v == 'all')}), quote=True)}" class="pill-link">JSON</a>
+      </div>
+    </div>
+
+    <div class="board-toolbar">
+      <div class="view-strip">
+        {view_controls_html}
+      </div>
+      <form method="get" action="/schedule-board" class="board-search">
+        <input type="hidden" name="days" value="{day_count}" />
+        <input type="hidden" name="view" value="{_esc(str(selected_view.get('key') or 'all'), quote=True)}" />
+        <div>
+          <label for="boardQuery">Filter Board</label>
+          <input id="boardQuery" type="text" name="q" value="{_esc(board_query, quote=True)}" placeholder="Search event, room, or door" />
+        </div>
+        <button type="submit" class="sm">Apply</button>
+        {'' if not board_query else f'<a class="pill-link" href="{_esc(_board_url(days_value=day_count, view_value=str(selected_view.get("key") or "all"), query_value=""), quote=True)}">Clear</a>'}
+      </form>
+    </div>
+
+    <div class="summary-grid">
+      <div class="summary-card"><div class="label">PCO Events</div><div class="value">{summary["eventCount"]}</div><div class="meta">Scheduled through Planning Center</div></div>
+      <div class="summary-card"><div class="label">Total Board Items</div><div class="value">{summary["totalItems"]}</div><div class="meta">PCO events, office hours, and manual access</div></div>
+      <div class="summary-card"><div class="label">Doors With Coverage</div><div class="value">{summary["activeDoors"]}</div><div class="meta">Door groups with at least one unlock window</div></div>
+      <div class="summary-card"><div class="label">Warnings</div><div class="value">{summary["roomConflictCount"] + summary["sharedDoorCount"]}</div><div class="meta">{summary["roomConflictCount"]} room conflicts, {summary["sharedDoorCount"]} shared door windows</div></div>
+    </div>
+
+    <div class="warning-grid">
+      <div class="warn-card">
+        <span class="card-title">Room Conflicts</span>
+        {room_conflicts_html}
+      </div>
+      <div class="warn-card secondary">
+        <span class="card-title">Shared Door Coverage</span>
+        {shared_door_html}
+      </div>
+    </div>
+
+    <div class="card">
+      <span class="card-title">Daily Schedule</span>
+      <div class="day-grid-wrap">
+        <div class="day-grid">
+          {event_columns_html}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <span class="card-title">Door Timeline</span>
+      <p style="font-size:13px;color:#64748b;margin:0 0 12px;">Each row is a door group. Each cell is one day, with bars showing exactly when that door will be unlocked. Hover for the events driving that window.</p>
+      <div class="matrix-wrap">
+        <div class="schedule-matrix">
+          {matrix_html}
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
+        return HTMLResponse(content=html_out, status_code=200)
+
+    @app.get("/exception-calendar", response_class=HTMLResponse)
+    async def exception_calendar_page() -> HTMLResponse:
+        return RedirectResponse(url="/office-hours#office-hours-calendar", status_code=307)
+
     # ── Mapping API ──────────────────────────────────────────────────────
 
     def _read_mapping() -> dict:
@@ -2461,6 +3813,20 @@ def create_app() -> FastAPI:
         excl = rules.get("excludeEventsByRoomContains")
         if excl is not None and not isinstance(excl, list):
             return "'rules.excludeEventsByRoomContains' must be an array of strings"
+        zone_views = data.get("zoneViews")
+        if zone_views is not None:
+            if not isinstance(zone_views, dict):
+                return "'zoneViews' must be an object"
+            for zk, zv in zone_views.items():
+                if not isinstance(zv, dict):
+                    return f"zoneViews['{zk}'] must be an object"
+                if "doorKeys" in zv and not isinstance(zv.get("doorKeys"), list):
+                    return f"zoneViews['{zk}'].doorKeys must be an array"
+                if "roomNames" in zv and not isinstance(zv.get("roomNames"), list):
+                    return f"zoneViews['{zk}'].roomNames must be an array"
+                for dk in (zv.get("doorKeys") or []):
+                    if dk not in data["doors"]:
+                        return f"zoneViews['{zk}'] references unknown door key '{dk}'"
         return None
 
     @app.get("/api/mapping")
@@ -2688,13 +4054,35 @@ def create_app() -> FastAPI:
         oh = load_office_hours(settings.office_hours_file)
         oh_enabled = bool(oh.get("enabled"))
         oh_schedule = oh.get("schedule") or {}
+        local_tz = ZoneInfo(settings.display_timezone)
 
         try:
             mapping = load_room_door_mapping(settings.room_door_mapping_file)
         except Exception:
             mapping = {}
         doors_map = mapping.get("doors") or {}
+        door_groups_cfg = mapping.get("doorGroups") or {}
         door_keys = list(doors_map.keys())
+
+        exception_entries = list_exception_entries(exception_calendar_file)
+        today_local = datetime.now(timezone.utc).astimezone(local_tz).date()
+        grid_start = today_local - timedelta(days=today_local.weekday())
+        grid_days: list[date] = [grid_start + timedelta(days=i) for i in range(42)]
+        entries_by_date: dict[str, list[dict]] = {}
+        for entry in exception_entries:
+            start_text = str(entry.get("fromDate") or entry.get("date") or "").strip()
+            end_text = str(entry.get("toDate") or start_text).strip()
+            try:
+                start_date = date.fromisoformat(start_text)
+                end_date = date.fromisoformat(end_text)
+            except Exception:
+                continue
+            if end_date < start_date:
+                continue
+            cursor = start_date
+            while cursor <= end_date:
+                entries_by_date.setdefault(cursor.isoformat(), []).append(entry)
+                cursor += timedelta(days=1)
 
         door_headers = "".join(
             [f'<th style="text-align:center;white-space:nowrap">{_esc(str(doors_map[dk].get("label", dk)))}</th>' for dk in door_keys]
@@ -2740,6 +4128,78 @@ def create_app() -> FastAPI:
         help_weekly = _help_tip(
             "For each day, set one or more time ranges and select which door groups unlock in those ranges."
         )
+        _indiv_opts = "".join(
+            f'<option value="single:{_esc(dk, quote=True)}">{_esc(str((doors_map.get(dk) or {}).get("label") or dk))}</option>'
+            for dk in doors_map.keys()
+        )
+        _group_opts = "".join(
+            f'<option value="group:{_esc(gk, quote=True)}" data-keys="{_esc(",".join(str(k) for k in (gv.get("doorKeys") or [])), quote=True)}">'
+            f'{_esc(str(gv.get("label") or gk))}</option>'
+            for gk, gv in door_groups_cfg.items()
+        )
+        target_options_html = (
+            '<option value="all">All Doors</option>'
+            + (f'<optgroup label="Individual Doors">{_indiv_opts}</optgroup>' if _indiv_opts else "")
+            + (f'<optgroup label="Door Groups">{_group_opts}</optgroup>' if _group_opts else "")
+        )
+
+        def _exception_target_label(entry: dict) -> str:
+            keys = [str(k).strip() for k in (entry.get("doorKeys") or []) if str(k).strip()]
+            if not keys:
+                return "All doors"
+            labels = [str((doors_map.get(k) or {}).get("label") or k) for k in keys]
+            return ", ".join(labels)
+
+        def _exception_range_label(entry: dict) -> str:
+            start_text = str(entry.get("fromDate") or entry.get("date") or "").strip()
+            end_text = str(entry.get("toDate") or start_text).strip()
+            return start_text if not end_text or end_text == start_text else f"{start_text} → {end_text}"
+
+        exception_rows_html = ""
+        for entry in exception_entries:
+            kind = str(entry.get("kind") or "")
+            badge_cls = "evt-badge evt-badge-closure" if kind == "closure" else "evt-badge evt-badge-exception-open"
+            badge_label = "Office Closed" if kind == "closure" else "Extra Hours"
+            when_text = _exception_range_label(entry)
+            if kind == "special_open":
+                when_text += f" · {str(entry.get('startTime') or '')}-{str(entry.get('endTime') or '')}"
+            note_html = _esc(str(entry.get("note") or "")) or '<span style="color:#94a3b8">—</span>'
+            exception_rows_html += (
+                "<tr>"
+                f'<td><span class="{badge_cls}">{badge_label}</span></td>'
+                f'<td style="white-space:nowrap">{_esc(when_text)}</td>'
+                f'<td>{_esc(str(entry.get("label") or ""))}</td>'
+                f'<td>{_esc(_exception_target_label(entry))}</td>'
+                f'<td>{note_html}</td>'
+                f'<td><button class="sm danger" data-id="{_esc(str(entry.get("id") or ""), quote=True)}" onclick="deleteExceptionEntry(this)">Delete</button></td>'
+                "</tr>"
+            )
+
+        calendar_grid_parts: list[str] = [
+            "".join(f'<div class="cal-head">{label}</div>' for label in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+        ]
+        for cell_date in grid_days:
+            date_key = cell_date.isoformat()
+            cell_entries = entries_by_date.get(date_key) or []
+            today_cls = " cal-cell-today" if cell_date == today_local else ""
+            month_cls = "" if cell_date.month == today_local.month else " cal-cell-muted"
+            item_html = ""
+            for entry in cell_entries[:3]:
+                kind = str(entry.get("kind") or "")
+                badge_cls = "mini-entry mini-entry-closure" if kind == "closure" else "mini-entry mini-entry-open"
+                time_label = ""
+                if kind == "special_open":
+                    time_label = f'{_esc(str(entry.get("startTime") or ""))}-{_esc(str(entry.get("endTime") or ""))} '
+                item_html += f'<div class="{badge_cls}" title="{_esc(str(entry.get("label") or ""), quote=True)}">{time_label}{_esc(str(entry.get("label") or ""))}</div>'
+            if len(cell_entries) > 3:
+                item_html += f'<div class="mini-more">+{len(cell_entries) - 3} more</div>'
+            calendar_grid_parts.append(
+                f'<div class="cal-cell{today_cls}{month_cls}">'
+                f'<div class="cal-date">{cell_date.day}</div>'
+                f'<div class="cal-items">{item_html}</div>'
+                '</div>'
+            )
+        office_calendar_grid_html = "".join(calendar_grid_parts)
 
         html_out = f"""<!doctype html>
 <html lang="en">
@@ -2753,6 +4213,30 @@ def create_app() -> FastAPI:
     .ranges-input:focus {{ outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px #bfdbfe; }}
     .toggle-row {{ display: flex; align-items: center; gap: 10px; }}
     .toggle-label {{ font-size: 15px; font-weight: 600; cursor: pointer; }}
+    .summary-row {{ display:flex; gap:10px; flex-wrap:wrap; margin:0 0 14px; }}
+    .summary-pill {{ font-size:12px; font-weight:700; padding:4px 10px; border-radius:999px; background:#eff6ff; color:#1d4ed8; }}
+    .planner-grid {{ display:grid; grid-template-columns: minmax(320px, 420px) 1fr; gap:16px; align-items:start; }}
+    .form-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }}
+    .form-grid .full {{ grid-column:1 / -1; }}
+    .field-label {{ font-size:12px; color:#64748b; font-weight:700; margin-bottom:4px; display:block; }}
+    .field-help {{ font-size:12px; color:#64748b; margin-top:8px; line-height:1.5; }}
+    .calendar-grid {{ display:grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap:8px; }}
+    .cal-head {{ font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:.06em; padding:0 4px; }}
+    .cal-cell {{ min-height:124px; background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:10px; }}
+    .cal-cell-today {{ border-color:#93c5fd; box-shadow:0 0 0 1px #bfdbfe inset; }}
+    .cal-cell-muted {{ background:#f8fafc; }}
+    .cal-date {{ font-size:13px; font-weight:700; color:#0f172a; margin-bottom:8px; }}
+    .cal-items {{ display:flex; flex-direction:column; gap:6px; }}
+    .mini-entry {{ font-size:11px; line-height:1.35; border-radius:8px; padding:5px 7px; font-weight:600; }}
+    .mini-entry-closure {{ background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }}
+    .mini-entry-open {{ background:#f5f3ff; color:#6d28d9; border:1px solid #ddd6fe; }}
+    .mini-more {{ font-size:11px; color:#64748b; padding:2px 2px 0; }}
+    @media (max-width: 980px) {{
+      .planner-grid {{ grid-template-columns:1fr; }}
+    }}
+    @media (max-width: 640px) {{
+      .calendar-grid {{ min-width:760px; }}
+    }}
   </style>
 </head>
 <body>
@@ -2770,6 +4254,9 @@ def create_app() -> FastAPI:
       <p style="font-size:13px;color:#475569;margin:0;">
         1) Enable Office Hours. 2) Enter day/time ranges. 3) Check doors for each day. 4) Save.
         These windows are merged with event windows during sync.
+      </p>
+      <p style="font-size:13px;color:#64748b;margin:10px 0 0;">
+        For holidays, closures, or one-time extra office openings, use the <a href="#office-hours-calendar">Office Hours Calendar</a> section below.
       </p>
     </div>
 
@@ -2808,6 +4295,107 @@ def create_app() -> FastAPI:
         <a href="/dashboard" style="font-size:14px;color:#64748b;">Cancel</a>
       </div>
     </form>
+
+    <div id="office-hours-calendar" class="card" style="margin-top:18px;background:#fff7ed;border-color:#fed7aa;scroll-margin-top:72px;">
+      <span class="card-title">Office Hours Calendar Overrides</span>
+      <p style="font-size:13px;color:#9a3412;margin:0;">
+        Use this only for office-hours exceptions. It removes or adds office-hours access windows and does <strong>not</strong> cancel anything scheduled through Planning Center.
+      </p>
+    </div>
+
+    <div class="summary-row">
+      <span class="summary-pill">{len(exception_entries)} saved office-hours exception{"s" if len(exception_entries) != 1 else ""}</span>
+      <span class="summary-pill" style="background:#ecfdf5;color:#166534;">Timezone: {_esc(settings.display_timezone)}</span>
+      <span class="summary-pill" style="background:#fff7ed;color:#c2410c;">Office Closed removes office-hours windows. Extra Hours adds one-off office-hours access.</span>
+    </div>
+
+    <div class="planner-grid">
+      <div>
+        <div class="card">
+          <span class="card-title">Add Office Hours Exception</span>
+          <form id="exceptionForm">
+            <div class="form-grid">
+              <div>
+                <label class="field-label" for="exKind">Type</label>
+                <select id="exKind" required onchange="toggleExceptionFields()">
+                  <option value="closure">Office Closed</option>
+                  <option value="special_open">Extra Office Hours</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label" for="exFromDate">From Date</label>
+                <input id="exFromDate" type="date" value="{_esc(today_local.isoformat(), quote=True)}" required />
+              </div>
+              <div>
+                <label class="field-label" for="exToDate">To Date</label>
+                <input id="exToDate" type="date" value="{_esc(today_local.isoformat(), quote=True)}" required />
+                <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+                  <button type="button" class="sm" onclick="setExceptionSpan(1)">1 Day</button>
+                  <button type="button" class="sm" onclick="setExceptionSpan(3)">3 Days</button>
+                  <button type="button" class="sm" onclick="setExceptionSpan(7)">1 Week</button>
+                </div>
+              </div>
+              <div class="full">
+                <label class="field-label" for="exTarget">Affected Doors</label>
+                <select id="exTarget">
+                  {target_options_html}
+                </select>
+              </div>
+              <div class="full">
+                <label class="field-label" for="exLabel">Title</label>
+                <input id="exLabel" type="text" maxlength="120" placeholder="e.g. Christmas Office Closed" required />
+              </div>
+              <div id="exStartWrap">
+                <label class="field-label" for="exStartTime">Start Time</label>
+                <input id="exStartTime" type="time" value="08:00" />
+              </div>
+              <div id="exEndWrap">
+                <label class="field-label" for="exEndTime">End Time</label>
+                <input id="exEndTime" type="time" value="12:00" />
+              </div>
+              <div class="full">
+                <label class="field-label" for="exNote">Notes</label>
+                <input id="exNote" type="text" maxlength="160" placeholder="Optional operator note" />
+              </div>
+            </div>
+            <p class="field-help">
+              <strong>Office Closed</strong>: removes recurring office-hours unlock windows for each day in the selected date range.
+              Leave “Affected Doors” on <strong>All Doors</strong> to close all office-hours doors for those dates.
+              <br />
+              <strong>Extra Office Hours</strong>: adds the same office-hours unlock window to each day in the selected date range.
+            </p>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+              <button type="submit" class="primary">Save Office Hours Exception</button>
+              <a href="/schedule-board" style="font-size:14px;color:#64748b;">View Schedule Board</a>
+            </div>
+          </form>
+        </div>
+
+        <div class="card">
+          <span class="card-title">Upcoming Office Hours Exceptions</span>
+          <div style="overflow:auto;">
+            <table>
+              <thead>
+                <tr><th>Type</th><th>Date / Time</th><th>Title</th><th>Doors</th><th>Notes</th><th></th></tr>
+              </thead>
+              <tbody>
+                {exception_rows_html or '<tr><td colspan="6" style="padding:12px;color:#94a3b8;">No office-hours exceptions yet.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <span class="card-title">Rolling Calendar</span>
+        <p style="font-size:13px;color:#64748b;margin:0 0 12px;">The next 6 weeks of office-hours closures and extra-hours entries. Use this as the long-range planning surface for holidays and weekday office changes.</p>
+        <div style="overflow:auto;">
+          <div class="calendar-grid">
+            {office_calendar_grid_html}
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -2849,6 +4437,104 @@ def create_app() -> FastAPI:
       }}
     }});
 
+    function resolveExceptionDoorKeys() {{
+      const sel = document.getElementById('exTarget');
+      const value = sel.value || 'all';
+      if (value === 'all') return [];
+      if (value.startsWith('single:')) return [value.slice(7)];
+      if (value.startsWith('group:')) {{
+        const opt = sel.options[sel.selectedIndex];
+        return (opt.dataset.keys || '').split(',').filter(Boolean);
+      }}
+      return [];
+    }}
+
+    function setExceptionSpan(days) {{
+      const fromInput = document.getElementById('exFromDate');
+      const toInput = document.getElementById('exToDate');
+      if (!fromInput.value) return;
+      const start = new Date(fromInput.value + 'T00:00:00');
+      start.setDate(start.getDate() + Math.max(0, Number(days || 1) - 1));
+      toInput.value = start.toISOString().slice(0, 10);
+      syncExceptionDateBounds();
+    }}
+
+    function syncExceptionDateBounds() {{
+      const fromInput = document.getElementById('exFromDate');
+      const toInput = document.getElementById('exToDate');
+      if (!fromInput || !toInput) return;
+      const fromValue = fromInput.value;
+      if (!fromValue) return;
+      toInput.min = fromValue;
+      if (!toInput.value || toInput.value < fromValue) {{
+        toInput.value = fromValue;
+      }}
+    }}
+
+    function toggleExceptionFields() {{
+      const kind = document.getElementById('exKind').value;
+      const showTimes = kind === 'special_open';
+      document.getElementById('exStartWrap').style.display = showTimes ? 'block' : 'none';
+      document.getElementById('exEndWrap').style.display = showTimes ? 'block' : 'none';
+      document.getElementById('exStartTime').required = showTimes;
+      document.getElementById('exEndTime').required = showTimes;
+    }}
+
+    document.getElementById('exceptionForm').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const kind = document.getElementById('exKind').value;
+      const payload = {{
+        kind,
+        fromDate: document.getElementById('exFromDate').value,
+        toDate: document.getElementById('exToDate').value,
+        doorKeys: resolveExceptionDoorKeys(),
+        label: document.getElementById('exLabel').value.trim(),
+        note: document.getElementById('exNote').value.trim(),
+        startTime: kind === 'special_open' ? document.getElementById('exStartTime').value : '',
+        endTime: kind === 'special_open' ? document.getElementById('exEndTime').value : '',
+      }};
+      try {{
+        const resp = await fetch('/api/exception-calendar', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.syncWarning) {{
+          showToast('Saved, but sync failed: ' + data.syncWarning, true);
+        }} else {{
+          showToast('Office-hours exception saved.', false);
+        }}
+        setTimeout(() => location.reload(), 1400);
+      }} catch (err) {{
+        showToast('Save failed: ' + err.message, true);
+      }}
+    }});
+
+    async function deleteExceptionEntry(btn) {{
+      if (!confirm('Delete this office-hours exception?')) return;
+      btn.disabled = true;
+      try {{
+        const resp = await fetch('/api/exception-calendar/delete', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ id: btn.dataset.id }}),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+        if (data.syncWarning) {{
+          showToast('Deleted, but sync failed: ' + data.syncWarning, true);
+        }} else {{
+          showToast('Office-hours exception deleted.', false);
+        }}
+        setTimeout(() => location.reload(), 1400);
+      }} catch (err) {{
+        showToast('Delete failed: ' + err.message, true);
+        btn.disabled = false;
+      }}
+    }}
+
     function showToast(msg, isError) {{
       const t = document.getElementById("toast");
       t.textContent = msg;
@@ -2856,6 +4542,11 @@ def create_app() -> FastAPI:
       t.style.display = "block";
       setTimeout(() => {{ t.style.display = "none"; }}, 3500);
     }}
+
+    document.getElementById('exFromDate').addEventListener('change', syncExceptionDateBounds);
+    document.getElementById('exToDate').addEventListener('change', syncExceptionDateBounds);
+    syncExceptionDateBounds();
+    toggleExceptionFields();
   </script>
 </body>
 </html>"""
